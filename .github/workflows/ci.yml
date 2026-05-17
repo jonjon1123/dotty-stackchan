@@ -92,6 +92,11 @@ jobs:
         run: |
           fail=0
           for f in docs/*.md; do
+            # Skip symlinks — root-level files (README, ROADMAP, SETUP, etc.)
+            # are symlinked into docs/ for the mkdocs nav but are primarily
+            # consumed as plain GitHub markdown; YAML frontmatter would clutter
+            # their on-GitHub rendering.
+            [ -L "$f" ] && continue
             if ! head -1 "$f" | grep -q '^---$'; then
               echo "FAIL: $f missing YAML frontmatter"
               fail=1
