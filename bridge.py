@@ -35,6 +35,7 @@ from textUtils import (
     build_turn_suffix,
 )
 
+from bridge.csrf import CSRFMiddleware
 from bridge.text import (
     CONTENT_FILTER_REPLACEMENT,
     MAX_SENTENCES,
@@ -2909,6 +2910,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ZeroClaw Bridge", lifespan=lifespan)
+app.add_middleware(CSRFMiddleware)
 
 # Prometheus exposition. Mounted as an ASGI sub-app so it shares the
 # bridge's listener — keep that listener LAN-only (bind 0.0.0.0 on a

@@ -8,6 +8,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="format-detection" content="telephone=no">
+<meta name="csrf-token" content="{{ csrf_token }}">
 <link rel="manifest" href="/ui/manifest.json">
 <link rel="icon" type="image/svg+xml" href="/ui/icon.svg">
 <link rel="apple-touch-icon" href="/ui/apple-touch-icon.png">
@@ -325,6 +326,16 @@
 <div id="restart-result" class="hidden"></div>
 
 <script>
+  // CSRF: every htmx-driven POST/PUT/DELETE under /ui/ must echo the
+  // signed token from the dotty_csrf cookie back as X-CSRF-Token. The
+  // raw token is exposed in the <meta name="csrf-token"> tag in <head>;
+  // CSRFMiddleware (bridge/csrf.py) sets it on the first GET and
+  // validates it on every mutating request.
+  document.body.addEventListener('htmx:configRequest', function (e) {
+    var t = document.querySelector('meta[name=csrf-token]');
+    if (t && t.content) { e.detail.headers['X-CSRF-Token'] = t.content; }
+  });
+
   // Conditional reveal: state.html dispatches `dotty-state-change` after
   // each htmx swap. Exactly one inner section in #state-context is shown
   // per state — the bottom half of the State card mutates with the top.

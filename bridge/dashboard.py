@@ -289,7 +289,11 @@ async def dashboard(request: Request) -> Any:
     chip_ctx = await asyncio.to_thread(_build_chip_context)
     return templates.TemplateResponse(
         request, "dashboard.html",
-        {"version": BRIDGE_VERSION, **chip_ctx},
+        {
+            "version": BRIDGE_VERSION,
+            "csrf_token": getattr(request.state, "csrf_token", ""),
+            **chip_ctx,
+        },
     )
 
 
