@@ -121,15 +121,15 @@ if [[ ! -x "${ZEROCLAW_BIN}" ]]; then
 fi
 info "zeroclaw binary OK (${ZEROCLAW_BIN})"
 
-# repo files
-if [[ ! -f "${REPO_DIR}/bridge.py" ]]; then
-    err "bridge.py not found at ${REPO_DIR}/bridge.py — run this script from the repo."
-    exit 1
-fi
-if [[ ! -f "${REPO_DIR}/bridge/requirements.txt" ]]; then
-    err "bridge/requirements.txt not found at ${REPO_DIR}/bridge/requirements.txt"
-    exit 1
-fi
+# repo files — bridge.py imports textUtils from custom-providers/ via a
+# sys.path shim, and the `bridge` package via normal Python import. Both
+# trees ship to BRIDGE_DIR alongside bridge.py.
+for f in bridge.py bridge/requirements.txt custom-providers/textUtils.py bridge/__init__.py; do
+    if [[ ! -e "${REPO_DIR}/${f}" ]]; then
+        err "${f} not found at ${REPO_DIR}/${f} — run this script from the dotty-stackchan repo."
+        exit 1
+    fi
+done
 info "Repo files OK (${REPO_DIR})"
 
 # ---------- create bridge directory ----------
@@ -139,9 +139,30 @@ run mkdir -p "${BRIDGE_DIR}"
 
 if $DRY_RUN; then
     info "[dry-run] cp ${REPO_DIR}/bridge.py -> ${BRIDGE_DIR}/bridge.py"
+    info "[dry-run] cp -r ${REPO_DIR}/{custom-providers,bridge} -> ${BRIDGE_DIR}/"
 else
     cp "${REPO_DIR}/bridge.py" "${BRIDGE_DIR}/bridge.py"
     info "Copied bridge.py"
+
+    # custom-providers/ holds textUtils.py + LLM/TTS provider modules that
+    # bridge.py imports via a sys.path shim. bridge/ holds metrics,
+    # dashboard, perception, etc. — bridge.py reaches into them via
+    # `from bridge.X import ...`. Both are required to avoid runtime
+    # ModuleNotFoundError (issue #13).
+    rm -rf "${BRIDGE_DIR}/custom-providers" "${BRIDGE_DIR}/bridge"
+    cp -r "${REPO_DIR}/custom-providers" "${BRIDGE_DIR}/custom-providers"
+    cp -r "${REPO_DIR}/bridge" "${BRIDGE_DIR}/bridge"
+    # CRITICAL: drop bridge/__init__.py so bridge/ acts as a PEP 420
+    # namespace package. Without this, `import bridge` resolves to the
+    # package (empty __init__) and uvicorn `bridge:app` fails with
+    # `module 'bridge' has no attribute 'app'`. With it removed, `import
+    # bridge` resolves to bridge.py (the FastAPI app) while
+    # `from bridge.metrics import ...` still works.
+    rm -f "${BRIDGE_DIR}/bridge/__init__.py"
+    # __pycache__ bloat from the source tree; the venv will regenerate.
+    find "${BRIDGE_DIR}/custom-providers" "${BRIDGE_DIR}/bridge" \
+        -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    info "Copied custom-providers/ and bridge/ (bridge/ as namespace pkg)"
 fi
 
 # ---------- create/update venv and install deps ----------
@@ -194,6 +215,22 @@ if $DRY_RUN; then
 else
     printf '%s\n' "${SERVICE_CONTENT}" > "${SERVICE_FILE}"
     info "Wrote ${SERVICE_FILE}"
+fi
+
+# ---------- smoke test: bridge.py imports cleanly ----------
+# Catches missing-module errors (like #13) here, with a readable traceback,
+# instead of letting systemd crash-loop the service and burying the cause
+# under restart noise. Skipped on dry-run since the venv won't exist.
+if ! $DRY_RUN; then
+    step "Import smoke test"
+    if (cd "${BRIDGE_DIR}" && "${VENV_DIR}/bin/python" -c "import bridge" 2>&1); then
+        info "bridge.py imports cleanly"
+    else
+        err "bridge.py failed to import — see traceback above."
+        err "Fix the import error before retrying; the systemd service will"
+        err "crash-loop with the same traceback if started in this state."
+        exit 1
+    fi
 fi
 
 # ---------- enable and start the service ----------
