@@ -24,10 +24,14 @@ def _import_zeroclaw():
     `from core.utils.textUtils import FALLBACK_EMOJI, _SENTENCE_BOUNDARY`
     so we need real values, not a MagicMock — otherwise the regex
     operations downstream would fail.
+
+    Restores sys.modules to its pre-call state after exec. Without this,
+    a MagicMock leaks into sys.modules['core.providers.llm.base'] and
+    pi_voice.py's `try: from core.providers.llm.base import ...` fallback
+    binds LLMProviderBase to a Mock attribute, producing a Mock-class
+    when `class LLMProvider(LLMProviderBase)` runs at import time.
     """
-    mock_logger_mod = MagicMock()
-    mock_logger_mod.setup_logging.return_value = MagicMock()
-    for pkg in (
+    polluted_keys = (
         "config",
         "config.logger",
         "core",
@@ -35,28 +39,42 @@ def _import_zeroclaw():
         "core.providers.llm",
         "core.providers.llm.base",
         "core.utils",
-    ):
-        sys.modules.setdefault(pkg, MagicMock())
-    sys.modules["config.logger"] = mock_logger_mod
-
-    repo_root = Path(__file__).resolve().parents[1]
-
-    # Pre-load real textUtils under the canonical bind-mount name so
-    # zeroclaw's `from core.utils.textUtils import ...` resolves to the
-    # actual module (not a Mock).
-    text_utils_path = repo_root / "custom-providers" / "textUtils.py"
-    text_utils_spec = importlib.util.spec_from_file_location(
-        "core.utils.textUtils", text_utils_path,
+        "core.utils.textUtils",
     )
-    text_utils_mod = importlib.util.module_from_spec(text_utils_spec)  # type: ignore[arg-type]
-    text_utils_spec.loader.exec_module(text_utils_mod)  # type: ignore[union-attr]
-    sys.modules["core.utils.textUtils"] = text_utils_mod
+    _MISSING = object()
+    saved = {k: sys.modules.get(k, _MISSING) for k in polluted_keys}
 
-    path = repo_root / "custom-providers" / "zeroclaw" / "zeroclaw.py"
-    spec = importlib.util.spec_from_file_location("zeroclaw_provider", path)
-    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod
+    try:
+        mock_logger_mod = MagicMock()
+        mock_logger_mod.setup_logging.return_value = MagicMock()
+        for pkg in polluted_keys[:-1]:  # all except core.utils.textUtils
+            sys.modules.setdefault(pkg, MagicMock())
+        sys.modules["config.logger"] = mock_logger_mod
+
+        repo_root = Path(__file__).resolve().parents[1]
+
+        # Pre-load real textUtils under the canonical bind-mount name so
+        # zeroclaw's `from core.utils.textUtils import ...` resolves to the
+        # actual module (not a Mock).
+        text_utils_path = repo_root / "custom-providers" / "textUtils.py"
+        text_utils_spec = importlib.util.spec_from_file_location(
+            "core.utils.textUtils", text_utils_path,
+        )
+        text_utils_mod = importlib.util.module_from_spec(text_utils_spec)  # type: ignore[arg-type]
+        text_utils_spec.loader.exec_module(text_utils_mod)  # type: ignore[union-attr]
+        sys.modules["core.utils.textUtils"] = text_utils_mod
+
+        path = repo_root / "custom-providers" / "zeroclaw" / "zeroclaw.py"
+        spec = importlib.util.spec_from_file_location("zeroclaw_provider", path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+    finally:
+        for k, v in saved.items():
+            if v is _MISSING:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v  # type: ignore[assignment]
 
 
 _mod = _import_zeroclaw()
