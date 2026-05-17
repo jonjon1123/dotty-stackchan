@@ -1,0 +1,21 @@
+# dotty-pi runtime — voice-tool brain on Unraid (#36 cutover).
+#
+# Bind-mount layout under /mnt/user/appdata/dotty-pi/:
+#   agent/         — pi's models.json (provider config, points at llama-swap)
+#   sessions/      — pi session state (currently unused; voice calls use --no-session)
+#   persona/       — Dotty persona files (migrated from RPi /root/.zeroclaw/workspace/)
+#   memory/        — brain.db FTS5 store (migrated from RPi)
+#   extensions/    — dotty-pi-ext/ installed extension (the 5 voice tools)
+#
+# network_mode: host so the container can reach llama-swap on :8080
+# (and so PiClient on the same Unraid host can `docker exec` cheaply).
+
+services:
+  dotty-pi:
+    image: dotty-pi:0.1.0
+    container_name: dotty-pi
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /mnt/user/appdata/dotty-pi:/root/.pi
+    command: ["sleep", "infinity"]
