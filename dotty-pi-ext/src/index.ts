@@ -8,6 +8,7 @@
 // etc).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { logTurnEnd } from "./lib/turn_logger.ts";
 import { memoryLookupTool } from "./tools/memory_lookup.ts";
 import { playSongTool } from "./tools/play_song.ts";
 import { rememberTool } from "./tools/remember.ts";
@@ -18,6 +19,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(rememberTool);
   pi.registerTool(thinkHardTool);
   pi.registerTool(playSongTool);
+  // Per-turn conversation auto-log — mirrors bridge.py /api/voice/memory_log,
+  // fired by Tier1Slim today. Lives here so the PiVoiceLLM cutover can
+  // retire that bridge endpoint.
+  pi.on("agent_end", logTurnEnd);
   // take_photo lands later (blocked on perception-cache rehoming).
   // set_led is intentionally absent: the LED ring is reserved for
   // mode/state indication, not voice-driven; see README.md "Not a tool".

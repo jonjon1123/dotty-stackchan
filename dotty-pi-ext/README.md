@@ -26,6 +26,25 @@ bodies; the contracts below summarise them).
 | `take_photo()` | Returns the latest cached vision description if ≤30 s old, otherwise a "can't see" reply. v2 will actively fire the take_photo MCP and await fresh capture. | `bridge.py::_voice_tool_take_photo` |
 | `play_song(name)` | Resolves free-form name against xiaozhi's `/xiaozhi/admin/songs` catalogue (60 s cache), then POSTs `/xiaozhi/admin/play-asset`. | `bridge.py::_voice_tool_play_song` |
 
+### Not a tool: per-turn auto-log
+
+After each completed user prompt, an `agent_end` handler in
+`src/lib/turn_logger.ts` writes a `category=conversation`,
+`importance=0.3` row to `brain.db` summarising the turn. Mirrors
+bridge.py's `/api/voice/memory_log` HTTP endpoint that Tier1Slim
+calls today. Lives as an event subscription rather than a tool
+because the agent doesn't decide to log — every successful prompt
+gets recorded automatically.
+
+Content shape (matches the bridge endpoint byte-for-byte):
+`"user: {user[:500]} | assistant: {assistant[:1000]}"`, both halves
+`.strip()`ed first, truncation is codepoint-aware (matches Python
+`str[:N]` semantics, not JS `String.slice()`).
+
+Skips writing when both halves are empty (e.g. a pure-tool turn
+with no text reply). Errors are swallowed and logged to stderr —
+the agent loop never fails because of memory write trouble.
+
 ### Not a tool: LED control
 
 The 12-pixel LED ring is **reserved for mode/state indication** and is
