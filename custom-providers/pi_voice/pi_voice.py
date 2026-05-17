@@ -116,16 +116,11 @@ class LLMProvider(LLMProviderBase):
         # the env-configured default.
         self._client: PiClient = client if client is not None else make_default_pi_client()
         self._first_turn = True
+        msg = f"PiVoiceLLM ready (container={self._container} kid_mode={self._kid_mode})"
         try:
-            logger.bind(tag=TAG).info(  # type: ignore[attr-defined]
-                "PiVoiceLLM ready (container=%s kid_mode=%s)",
-                self._container, self._kid_mode,
-            )
+            logger.bind(tag=TAG).info(msg)  # type: ignore[attr-defined]
         except AttributeError:
-            logger.info(
-                "PiVoiceLLM ready (container=%s kid_mode=%s)",
-                self._container, self._kid_mode,
-            )
+            logger.info(msg)
 
     # xiaozhi-server's voice loop calls this as a sync generator.
     # Each yielded string becomes a TTS chunk.

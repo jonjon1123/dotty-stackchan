@@ -15,7 +15,8 @@ selected_module:
   VAD: SileroVAD
   ASR: WhisperLocal
   # ASR: FunASR           # <-- swap back to FunASR (CPU, lower recall on kid speech)
-  LLM: Tier1Slim
+  LLM: PiVoiceLLM
+  # LLM: Tier1Slim         # <-- previous default: small/fast LLM with tool escalation to bridge
   # LLM: ZeroClawLLM       # <-- legacy: voice via ZeroClaw ACP (24K-token tax per turn)
   # LLM: OpenAICompat      # <-- switch to direct OpenAI-compatible LLM
   TTS: LocalPiper
@@ -103,6 +104,17 @@ TTS:
     output_dir: tmp/
 
 LLM:
+  # PiVoiceLLM — routes voice turns to the `dotty-pi` container via
+  # `docker exec -i dotty-pi pi --mode rpc ...`. Pi owns the agent loop and
+  # invokes tools (memory_lookup, think_hard, play_song, remember, ...) inside
+  # the dotty-pi-ext extension; only TTS-bound text reaches xiaozhi. See
+  # custom-providers/pi_voice/README.md for the architecture + the host-docker-
+  # socket requirement (the xiaozhi container must have /var/run/docker.sock
+  # and /usr/bin/docker bind-mounted — see docker-compose.yml).
+  PiVoiceLLM:
+    type: pi_voice
+    container_name: dotty-pi
+
   # Tier 1 slim — direct to llama-swap or any OpenAI-compatible endpoint with
   # OpenAI function-calling-style tool escalation. Calls bridge.py
   # /api/voice/escalate when the model emits tool_calls (memory_lookup,

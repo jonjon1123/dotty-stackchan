@@ -520,7 +520,7 @@ class SimpleHttpServer:
                     "session_id": conn.session_id,
                 }))
                 for pkt in pkts:
-                    if conn.client_abort or conn.is_exiting:
+                    if conn.client_abort or getattr(conn, "is_exiting", False):
                         self.logger.bind(tag=TAG).info(
                             f"play-asset aborted after {sent}/{len(pkts)} packets"
                         )

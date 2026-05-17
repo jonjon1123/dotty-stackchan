@@ -83,10 +83,29 @@ Owns the long-lived pi process. Per #36's Step-5 constraints:
 
 So xiaozhi-server's `core.providers.llm.pi_voice` import path resolves.
 
-## Wiring into xiaozhi-server (planned)
+## Wiring into xiaozhi-server
 
-Mount this directory as a volume into the xiaozhi container at
-`core/providers/llm/pi_voice/`, then in `data/.config.yaml`:
+Three things are required, all in the repo's `docker-compose.yml`:
+
+```yaml
+volumes:
+  # 1. the provider package itself
+  - ./custom-providers/pi_voice:/opt/xiaozhi-esp32-server/core/providers/llm/pi_voice
+  # 2. + 3. docker CLI binary + host docker socket — PiClient shells out to
+  # `docker exec -i dotty-pi pi --mode rpc ...` from INSIDE this container,
+  # which needs both the binary in $PATH and access to the daemon.
+  - /var/run/docker.sock:/var/run/docker.sock
+  - /usr/bin/docker:/usr/bin/docker:ro
+```
+
+⚠️ **Security caveat:** bind-mounting `/var/run/docker.sock` gives this
+container effective root on the docker host — it can `docker run --privileged
+anything` against the daemon. Acceptable for a single-purpose self-hosted
+appliance like Dotty; do NOT enable on a shared / multi-tenant host. If that
+trade-off isn't acceptable in your environment, refactor `pi_client.py` to
+talk to pi over a TCP/Unix socket exposed by a sidecar (out of scope for v1).
+
+Then in `data/.config.yaml`:
 
 ```yaml
 selected_module:
@@ -108,6 +127,14 @@ Existing `DOTTY_VOICE_PROVIDER=pi` env-var contract on the bridge will
 become the soak-toggle: when the xiaozhi-server side is on `PiVoiceLLM`
 and the bridge is still up, the bridge becomes a no-op pass-through;
 once soaked, bridge.py goes away entirely.
+
+### Recovery: known-good rollback
+
+If PiVoiceLLM misbehaves, flip back to Tier1Slim in `data/.config.yaml`
+(`selected_module.LLM: Tier1Slim`) and `docker compose restart
+xiaozhi-esp32-server`. The Tier1Slim provider, its volume mount, and its
+config block are still intact in the repo as a fallback. The docker-socket
+mount above is harmless when running other LLM providers.
 
 ## Open questions resolved during this slice
 

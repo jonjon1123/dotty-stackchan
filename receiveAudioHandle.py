@@ -992,7 +992,7 @@ async def _stream_singing(conn: "ConnectionHandler", opus_packets: list) -> None
             "session_id": conn.session_id,
         }))
         for packet in opus_packets:
-            if conn.client_abort or conn.is_exiting:
+            if conn.client_abort or getattr(conn, "is_exiting", False):
                 conn.logger.bind(tag=TAG).info(
                     f"Singing aborted after {sent}/{len(opus_packets)} packets"
                 )
@@ -1016,7 +1016,7 @@ async def _stream_singing(conn: "ConnectionHandler", opus_packets: list) -> None
 
 
 async def handleAudioMessage(conn: "ConnectionHandler", audio):
-    if conn.is_exiting:
+    if getattr(conn, "is_exiting", False):
         return
     have_voice = conn.vad.is_vad(conn, audio)
     if hasattr(conn, "just_woken_up") and conn.just_woken_up:

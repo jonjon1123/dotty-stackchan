@@ -38,6 +38,16 @@ services:
       - ./custom-providers/zeroclaw:/opt/xiaozhi-esp32-server/core/providers/llm/zeroclaw
       - ./custom-providers/openai_compat:/opt/xiaozhi-esp32-server/core/providers/llm/openai_compat
       - ./custom-providers/tier1_slim:/opt/xiaozhi-esp32-server/core/providers/llm/tier1_slim
+      - ./custom-providers/pi_voice:/opt/xiaozhi-esp32-server/core/providers/llm/pi_voice
+      # PiVoiceLLM shells out to `docker exec -i dotty-pi pi --mode rpc ...`,
+      # so this container needs the docker CLI binary AND the host docker
+      # socket. WARNING: mounting /var/run/docker.sock gives this container
+      # effective root on the docker host (it can `docker run --privileged
+      # anything`). Acceptable for a single-purpose self-hosted appliance;
+      # do not enable on a multi-tenant host. Required for `selected_module.LLM:
+      # PiVoiceLLM` — comment both lines out if running Tier1Slim / ZeroClawLLM.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
       - ./personas:/opt/xiaozhi-esp32-server/personas:ro
       - ./custom-providers/edge_stream/edge_stream.py:/opt/xiaozhi-esp32-server/core/providers/tts/edge_stream.py:ro
       - ./custom-providers/piper_local/piper_local.py:/opt/xiaozhi-esp32-server/core/providers/tts/piper_local.py:ro
