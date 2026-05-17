@@ -80,8 +80,23 @@ jobs:
             'numpy>=1.24,<3' \
             'aiohttp>=3.9,<4' \
             'requests>=2.31,<3'
-      - name: Run bridge unit tests
-        run: pytest tests/ -v --tb=short
+      - name: Run bridge + pi_voice unit tests
+        run: pytest tests/ custom-providers/pi_voice/tests/ -v --tb=short
+
+  pi-ext-tests:
+    name: dotty-pi-ext TS Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install dotty-pi-ext deps
+        working-directory: dotty-pi-ext
+        run: npm ci
+      - name: Run dotty-pi-ext tests
+        working-directory: dotty-pi-ext
+        run: npm test
 
   frontmatter-check:
     name: Frontmatter Check
@@ -123,7 +138,7 @@ jobs:
   notify-failure:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [yaml-lint, compose-validate, config-parse, python-syntax, python-tests, frontmatter-check, docs-links]
+    needs: [yaml-lint, compose-validate, config-parse, python-syntax, python-tests, pi-ext-tests, frontmatter-check, docs-links]
     if: failure()
     env:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
