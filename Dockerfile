@@ -1,5 +1,5 @@
-# Pinned 2026-04-25 from :server_latest
-FROM ghcr.io/xinnan-tech/xiaozhi-esp32-server@sha256:2f18537ac753884b5afb8e18d4e1a80926f795a5b5128cd81107028f6edb8120
+# Pinned 2026-05-17 from :server_0.9.3
+FROM ghcr.io/xinnan-tech/xiaozhi-esp32-server@sha256:3accd82a7d1a6c01c58f32f6199400a11655d607780b80219493123dedbb347e
 
 RUN pip install --no-cache-dir piper-tts scipy numpy mido faster-whisper
 
