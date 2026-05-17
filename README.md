@@ -82,6 +82,17 @@ The bridge serves a web dashboard at `http://<ZEROCLAW_HOST>:8080/ui` — host s
 
 ## Get it running
 
+The stack is three moving pieces — the device, xiaozhi-server (voice I/O), and zeroclaw-bridge (the FastAPI gateway in front of the LLM/ZeroClaw). You have a choice about how to host the two server pieces:
+
+| Shape | What you run | When to pick it |
+|---|---|---|
+| **Single-host** | One Docker compose file ([`compose.all-in-one.yml`](./compose.all-in-one.yml)) brings up xiaozhi-server **and** the bridge as containers on the same host. | Easiest first install. Recommended unless you already have a reason to split. |
+| **Multi-host** | xiaozhi-server runs from [`docker-compose.yml`](./docker-compose.yml) on a Docker host; the bridge is installed natively (systemd) on a different machine via [`scripts/install-bridge.sh`](./scripts/install-bridge.sh). | You want the bridge on a low-power always-on box (e.g. a Raspberry Pi) and the GPU/Docker host on a beefier machine. The reference deployment runs this way. |
+
+Want fully offline? Add [`compose.local.override.yml`](./compose.local.override.yml) to either shape — it layers in an Ollama container so the LLM call no longer leaves the LAN.
+
+Then:
+
 - [`docs/quickstart.md`](./docs/quickstart.md) — 15-minute happy path: flash, configure, first turn. Includes placeholder substitution table, deployment layout, endpoints, reboot survival, and common ops snippets.
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) — symptom-first lookup for common (and obscure) failure modes.
 

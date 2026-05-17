@@ -89,14 +89,32 @@ make doctor
 All checks should pass (green). If any fail, see
 [troubleshooting.md](troubleshooting.md).
 
-## 5. Connect the robot
+## 5. Install the bridge
+
+This step depends on which deployment shape you picked (see the table in the [README](../README.md#get-it-running)).
+
+**Single-host (compose.all-in-one):** the bridge runs as a container in the same compose stack. There is no separate install step — skip to step 6.
+
+**Multi-host (default `make setup`):** install the bridge natively on the host that will run it. From a checkout of this repo *on that host* (not the Docker host):
+
+```bash
+sudo scripts/install-bridge.sh \
+  --bridge-dir /root/zeroclaw-bridge \
+  --zeroclaw-bin "$(which zeroclaw)"
+```
+
+The script copies `bridge.py` + the `custom-providers/` and `bridge/` trees into the install dir, creates a Python venv, writes a systemd unit, runs an import smoke test, and starts the service. Health check at `http://<ZEROCLAW_HOST>:8080/health` should return `{"status":"ok",...}`.
+
+If the bridge host is a different machine from the Docker host, clone the repo there first.
+
+## 6. Connect the robot
 
 1. Power on the robot (USB-C or battery).
 2. On the device screen, navigate to **Settings > Advanced Options**.
 3. Enter the OTA URL: `http://<YOUR_SERVER_IP>:8003/xiaozhi/ota/`
 4. The robot connects via WebSocket and shows a face.
 
-## 6. First voice turn
+## 7. First voice turn
 
 Tap the screen to enter voice mode and say "Hello Dotty!"
 
@@ -148,7 +166,7 @@ Files you will definitely need to edit before first run:
 
 - `.config.yaml` — replace `<XIAOZHI_HOST>`, `<ZEROCLAW_HOST>`, and customise the `prompt:` block.
 - `docker-compose.yml` — set `TZ` to your timezone.
-- `zeroclaw-bridge.service` — adjust paths if the bridge doesn't live at `/root/zeroclaw-bridge/`.
+- `zeroclaw-bridge.service` — only if you're installing the bridge by hand. `scripts/install-bridge.sh` (see step 5) writes its own copy with the right paths and you shouldn't need to touch this file.
 
 ---
 
