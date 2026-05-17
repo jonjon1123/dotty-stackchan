@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,6 +37,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # ---------------------------------------------------------------------------
 # Import bridge.py as `bridge_app` and neutralise its heavy lifespan.
 # ---------------------------------------------------------------------------
+
+# State files (kid-mode + smart-mode) default to /root/zeroclaw-bridge/state/...
+# which the CI runner can neither read (/root is 700) nor write. Python 3.12's
+# Path.exists() raises PermissionError on stat failure (3.13+ swallows), so
+# even reading the toggle at module-import time blows up. Redirect both to a
+# writable temp dir before import.
+_state_dir = Path(tempfile.mkdtemp(prefix="dotty-bridge-test-state-"))
+os.environ.setdefault("DOTTY_KID_MODE_STATE", str(_state_dir / "kid-mode"))
+os.environ.setdefault("DOTTY_SMART_MODE_STATE", str(_state_dir / "smart-mode"))
 
 # Env-var skips for background loops that the lifespan would otherwise
 # spawn. These have no effect at module-import time but keep the lifespan
