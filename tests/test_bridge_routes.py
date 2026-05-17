@@ -46,6 +46,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 _state_dir = Path(tempfile.mkdtemp(prefix="dotty-bridge-test-state-"))
 os.environ.setdefault("DOTTY_KID_MODE_STATE", str(_state_dir / "kid-mode"))
 os.environ.setdefault("DOTTY_SMART_MODE_STATE", str(_state_dir / "smart-mode"))
+# CONVO_LOG_DIR defaults to /root/zeroclaw-bridge/logs — same problem. Used
+# by /api/message and /api/message/stream via _convo_log.log_turn.
+os.environ.setdefault("CONVO_LOG_DIR", str(_state_dir / "logs"))
 
 # Env-var skips for background loops that the lifespan would otherwise
 # spawn. These have no effect at module-import time but keep the lifespan
@@ -346,6 +349,340 @@ class VoiceRememberTests(unittest.TestCase):
             )
         kwargs = mock_store.call_args.kwargs
         self.assertEqual(len(kwargs["content"]), 300)
+
+
+# ---------------------------------------------------------------------------
+# /api/voice/escalate — Tier-2 tool dispatcher
+# ---------------------------------------------------------------------------
+
+class VoiceEscalateTests(unittest.TestCase):
+    def setUp(self):
+        _install_acp_stub()
+
+    def test_unknown_tool_returns_friendly_string(self):
+        r = client.post("/api/voice/escalate", json={
+            "tool": "not_a_tool", "args": {}, "session_id": "s",
+        })
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["result"], "(unknown tool: not_a_tool)")
+
+    def test_known_tool_result_round_trips(self):
+        async def fake_handler(args, session_id):
+            return f"echo:{args.get('query', '')}|sid={session_id}"
+
+        with patch.dict(
+            bridge_app._VOICE_TOOLS,
+            {"memory_lookup": fake_handler},
+        ):
+            r = client.post("/api/voice/escalate", json={
+                "tool": "memory_lookup",
+                "args": {"query": "birthday"},
+                "session_id": "sess-1",
+            })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["result"], "echo:birthday|sid=sess-1")
+
+    def test_handler_exception_yields_failed_result(self):
+        async def boom(args, session_id):
+            raise RuntimeError("tool exploded")
+
+        with patch.dict(
+            bridge_app._VOICE_TOOLS,
+            {"think_hard": boom},
+        ):
+            r = client.post("/api/voice/escalate", json={
+                "tool": "think_hard", "args": {"question": "?"},
+            })
+        self.assertEqual(r.status_code, 200)
+        # Handler exception is swallowed; client always gets 200 + result.
+        self.assertEqual(r.json()["result"], "(think_hard failed)")
+
+    def test_validation_missing_tool(self):
+        r = client.post("/api/voice/escalate", json={"args": {}})
+        self.assertEqual(r.status_code, 422)
+
+
+# ---------------------------------------------------------------------------
+# /api/vision/explain  + /api/audio/explain — VLM / ASR description routes
+# ---------------------------------------------------------------------------
+
+class VisionExplainTests(unittest.TestCase):
+    """Just the simple description path. The room_view roster branch has
+    its own substantial state-machine + cooldown logic and warrants its
+    own dedicated test module."""
+
+    def setUp(self):
+        _install_acp_stub()
+        bridge_app._vision_cache.clear()
+
+    def test_returns_description_and_caches_it(self):
+        with patch.object(
+            bridge_app, "_call_vision_api",
+            return_value="I see a small black robot on a desk.",
+        ):
+            r = client.post(
+                "/api/vision/explain",
+                headers={"device-id": "dotty-x1"},
+                files={"file": ("photo.jpg", b"\xff\xd8\xff\xe0fake", "image/jpeg")},
+                data={"question": "What's in the photo?"},
+            )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIn("black robot", body["description"])
+        # Cache populated for the device.
+        self.assertIn("dotty-x1", bridge_app._vision_cache)
+
+
+class AudioExplainTests(unittest.TestCase):
+    def setUp(self):
+        _install_acp_stub()
+        bridge_app._audio_cache.clear()
+
+    def test_returns_caption_and_caches_it(self):
+        with patch.object(
+            bridge_app, "_call_audio_caption_api",
+            return_value="I hear footsteps and a door closing.",
+        ):
+            r = client.post(
+                "/api/audio/explain",
+                headers={"device-id": "dotty-x1"},
+                files={"file": ("clip.wav", b"RIFFfake", "audio/wav")},
+                data={"question": "What's that sound?"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("footsteps", r.json()["description"])
+        self.assertIn("dotty-x1", bridge_app._audio_cache)
+
+    def test_caption_failure_returns_fallback_string(self):
+        # _call_audio_caption_api catches its own exceptions and returns a
+        # human-friendly fallback string — the route still 200s.
+        with patch.object(
+            bridge_app, "_call_audio_caption_api",
+            return_value="I couldn't quite hear that clearly.",
+        ):
+            r = client.post(
+                "/api/audio/explain",
+                files={"file": ("clip.wav", b"RIFFfake", "audio/wav")},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("couldn't quite hear", r.json()["description"])
+
+
+# ---------------------------------------------------------------------------
+# /api/message — the central voice turn
+# ---------------------------------------------------------------------------
+
+class MessageTests(unittest.TestCase):
+    """Patch acp.prompt to control the LLM response, _refresh_caches to
+    skip network. /api/message wraps the response in emoji-prefix +
+    sentence-truncation, so we assert on the shape rather than exact text."""
+
+    def setUp(self):
+        _install_acp_stub()
+        # acp.prompt is awaited; AsyncMock is required.
+        bridge_app.acp.prompt = AsyncMock(return_value="😊 Hi there friend.")
+        bridge_app.acp._last_phases = None
+
+    def test_happy_path_returns_response_and_session_id(self):
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message", json={
+                "content": "hello",
+                "channel": "dotty",
+                "session_id": "s-abc",
+            })
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["session_id"], "s-abc")
+        self.assertIn("Hi there", body["response"])
+        # Emoji prefix preserved by the response pipeline.
+        self.assertTrue(body["response"].lstrip().startswith("😊"))
+
+    def test_missing_session_id_gets_auto_uuid(self):
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message", json={"content": "hi"})
+        self.assertEqual(r.status_code, 200)
+        sid = r.json()["session_id"]
+        # UUIDs are 36 chars with hyphens.
+        self.assertEqual(len(sid), 36)
+        self.assertEqual(sid.count("-"), 4)
+
+    def test_acp_timeout_yields_fallback_response(self):
+        bridge_app.acp.prompt = AsyncMock(side_effect=__import__("asyncio").TimeoutError())
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message", json={"content": "hi"})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIn("thinking too slowly", body["response"])
+
+    def test_acp_exception_yields_generic_fallback(self):
+        bridge_app.acp.prompt = AsyncMock(side_effect=RuntimeError("boom"))
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message", json={"content": "hi"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("Something went wrong", r.json()["response"])
+
+    def test_missing_emoji_prefix_gets_one_added(self):
+        # When the LLM forgets its emoji, the bridge prepends FALLBACK_EMOJI.
+        bridge_app.acp.prompt = AsyncMock(return_value="Hi without emoji.")
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message", json={"content": "hi"})
+        body = r.json()
+        first_char = body["response"].lstrip()[0]
+        # Must be one of the nine allowed emoji (FALLBACK_EMOJI is 😐).
+        self.assertIn(first_char, bridge_app.ALLOWED_EMOJIS)
+
+
+# ---------------------------------------------------------------------------
+# /api/message/stream — NDJSON streaming variant
+# ---------------------------------------------------------------------------
+
+class MessageStreamTests(unittest.TestCase):
+    """Stream emits one JSON line per chunk_cb invocation, then a `final`
+    line. When acp.prompt returns immediately without calling chunk_cb
+    (the simplest path), the route emits the full text as a single chunk
+    + the final line."""
+
+    def setUp(self):
+        _install_acp_stub()
+        bridge_app.acp.prompt = AsyncMock(return_value="😊 Hello.")
+        bridge_app.acp._last_phases = None
+
+    def _read_ndjson(self, raw: bytes) -> list[dict]:
+        import json as _json
+        return [_json.loads(line) for line in raw.decode().splitlines() if line.strip()]
+
+    def test_ndjson_emits_chunk_then_final(self):
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message/stream",
+                            json={"content": "hi", "session_id": "s-1"})
+        self.assertEqual(r.status_code, 200)
+        records = self._read_ndjson(r.content)
+        # At least one chunk and exactly one final.
+        types = [rec["type"] for rec in records]
+        self.assertIn("chunk", types)
+        self.assertEqual(types.count("final"), 1)
+        # Final carries session_id + complete content.
+        final = records[-1]
+        self.assertEqual(final["session_id"], "s-1")
+        self.assertIn("Hello", final["content"])
+
+    def test_stream_timeout_emits_error_frame(self):
+        bridge_app.acp.prompt = AsyncMock(side_effect=__import__("asyncio").TimeoutError())
+        with patch.object(bridge_app, "_refresh_caches",
+                          new=AsyncMock(return_value=None)):
+            r = client.post("/api/message/stream",
+                            json={"content": "hi"})
+        records = self._read_ndjson(r.content)
+        types = [rec["type"] for rec in records]
+        self.assertIn("error", types)
+        err = next(r for r in records if r["type"] == "error")
+        self.assertIn("thinking too slowly", err["message"])
+
+
+# ---------------------------------------------------------------------------
+# /api/perception/feed — SSE smoke
+# ---------------------------------------------------------------------------
+
+class PerceptionFeedTests(unittest.IsolatedAsyncioTestCase):
+    """Functional test of the perception bus the SSE route consumes —
+    subscribe(), broadcast(), unsubscribe().
+
+    A full SSE round-trip through TestClient or httpx.AsyncClient hangs:
+    SSE responses don't flush headers until the first body chunk, and
+    the route's keepalive sits in queue.get() for 15s before its first
+    yield. Driving the whole loop requires either a real HTTP server or
+    a frame-level transport mock. Both are out of scope for boundary
+    smoke tests, so we cover the same logic by exercising the route's
+    actual dependencies directly. Tracking proper SSE coverage as a
+    follow-up."""
+
+    async def asyncSetUp(self):
+        _install_acp_stub()
+        _reset_perception_state()
+        # Clean slate — leftover queues from earlier tests would pull events.
+        bridge_app._perception_listeners.clear()
+
+    async def test_subscribe_receives_broadcast(self):
+        import asyncio as _asyncio
+
+        queue = bridge_app._perception_subscribe()
+        try:
+            bridge_app._perception_broadcast({
+                "name": "face_detected",
+                "device_id": "dev-1",
+                "ts": 1234.5,
+                "data": {"hint": "test"},
+            })
+            event = await _asyncio.wait_for(queue.get(), timeout=1.0)
+            self.assertEqual(event["name"], "face_detected")
+            self.assertEqual(event["device_id"], "dev-1")
+            self.assertEqual(event["data"], {"hint": "test"})
+        finally:
+            bridge_app._perception_unsubscribe(queue)
+
+    async def test_unsubscribe_drops_listener(self):
+        queue = bridge_app._perception_subscribe()
+        self.assertIn(queue, bridge_app._perception_listeners)
+        bridge_app._perception_unsubscribe(queue)
+        self.assertNotIn(queue, bridge_app._perception_listeners)
+
+    async def test_broadcast_with_no_listeners_is_noop(self):
+        # Empty listeners list — broadcast must not raise.
+        self.assertEqual(bridge_app._perception_listeners, [])
+        bridge_app._perception_broadcast({
+            "name": "face_detected", "device_id": "x", "ts": 0.0, "data": {},
+        })
+
+
+# ---------------------------------------------------------------------------
+# /api/vision/latest/{device_id} — event-driven waiter
+# ---------------------------------------------------------------------------
+
+class VisionLatestTests(unittest.IsolatedAsyncioTestCase):
+    """The endpoint pops _vision_cache[device_id], registers an asyncio.Event
+    waiter, then blocks for up to 15s. To exercise the happy path we use
+    httpx.AsyncClient so we can run a concurrent populate-and-fire task on
+    the same event loop."""
+
+    async def asyncSetUp(self):
+        _install_acp_stub()
+        bridge_app._vision_cache.clear()
+        bridge_app._vision_events.clear()
+
+    async def test_returns_cached_description_when_populated_mid_wait(self):
+        import asyncio as _asyncio
+
+        import httpx
+        from httpx import ASGITransport
+
+        async def _populate():
+            # Wait long enough for the endpoint to register its waiter.
+            await _asyncio.sleep(0.05)
+            bridge_app._vision_cache["dev1"] = {
+                "description": "saw a cat",
+                "room_match_person_id": None,
+            }
+            for ev in bridge_app._vision_events.get("dev1", []):
+                ev.set()
+
+        transport = ASGITransport(app=bridge_app.app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as ac:
+            populate_task = _asyncio.create_task(_populate())
+            r = await ac.get("/api/vision/latest/dev1")
+            await populate_task
+
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["description"], "saw a cat")
+        self.assertIsNone(body["room_match_person_id"])
 
 
 if __name__ == "__main__":
