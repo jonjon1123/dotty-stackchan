@@ -325,6 +325,13 @@ CALENDAR_PERSON_PREFIX_RE: str = os.environ.get(
     r"^\s*\[(?P<person>[A-Za-z][A-Za-z0-9_-]{0,31})\]\s*(?P<rest>.+)$",
 )
 
+# Proactive greeter state file — env-overridable but defaults under the
+# bind-mounted state dir.
+GREETER_STATE_PATH: str = os.environ.get(
+    "GREETER_STATE_PATH",
+    str(STATE_DIR / "greeter_state.json"),
+)
+
 # ---------------------------------------------------------------------------
 # Security capture loop — fires on state_changed → security; runs a
 # per-device interval timer that does take_photo + capture_audio +

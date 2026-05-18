@@ -33,6 +33,7 @@ from dispatch import (
     VLMClient,
     XiaozhiAdminClient,
 )
+from greeter import CalendarFacade, ProactiveGreeter
 from household import HouseholdRegistry
 from logs import NdjsonWriter
 from perception import PerceptionState
@@ -293,6 +294,32 @@ async def lifespan(app: FastAPI):
         )
     else:
         log.info("calendar disabled (CALENDAR_ID env empty)")
+
+    # Layer 6 proactive greeter — narrative LLM + household-aware
+    # contextual greetings on face_recognized events. Honours
+    # GREETER_ENABLED.
+    async def _greeter_llm(prompt: str) -> str:
+        out = await narrative.chat(prompt, system_prompt="")
+        return out or ""
+
+    async def _greeter_tts(device_id: str, text: str) -> None:
+        await xiaozhi.say(device_id, text)
+
+    greeter = ProactiveGreeter(
+        state,
+        _greeter_llm,
+        CalendarFacade(
+            calendar_cache,
+            household_bucket=config.CALENDAR_HOUSEHOLD_BUCKET,
+        ),
+        _greeter_tts,
+        lambda: bool(getattr(app.state, "kid_mode", False)),
+        household_registry=household,
+        tz=config.LOCAL_TZ,
+        state_path=config.GREETER_STATE_PATH,
+    )
+    app.state.greeter = greeter
+    consumers.append(greeter)
 
     tasks = [
         asyncio.create_task(c.run(), name=type(c).__name__) for c in consumers
