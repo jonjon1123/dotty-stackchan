@@ -301,6 +301,31 @@ HOUSEHOLD_YAML_PATH: str = os.environ.get(
 )
 
 # ---------------------------------------------------------------------------
+# Weather + calendar — env-driven external data used by the greeter
+# prompt and the dashboard /api/calendar/today route. CALENDAR_IDS
+# empty (default) → calendar surface is a quiet no-op.
+# ---------------------------------------------------------------------------
+WEATHER_LOCATION: str = os.environ.get("WEATHER_LOCATION", "Brisbane")
+WEATHER_TTL_SEC: float = _env_float("WEATHER_TTL_SEC", 1800.0)
+
+CALENDAR_TTL_SEC: float = _env_float("CALENDAR_TTL_SEC", 7200.0)
+CALENDAR_IDS: tuple[str, ...] = tuple(
+    c.strip() for c in os.environ.get("CALENDAR_ID", "").split(",") if c.strip()
+)
+CALENDAR_SA_PATH: str = os.environ.get(
+    "CALENDAR_SA_PATH",
+    str(SECRETS_DIR / "google-calendar-sa.json"),
+)
+GWS_BIN: str = os.environ.get("GWS_BIN", "/usr/local/bin/gws")
+CALENDAR_HOUSEHOLD_BUCKET: str = os.environ.get(
+    "CALENDAR_HOUSEHOLD_BUCKET", "_household"
+)
+CALENDAR_PERSON_PREFIX_RE: str = os.environ.get(
+    "CALENDAR_PERSON_PREFIX_RE",
+    r"^\s*\[(?P<person>[A-Za-z][A-Za-z0-9_-]{0,31})\]\s*(?P<rest>.+)$",
+)
+
+# ---------------------------------------------------------------------------
 # Security capture loop — fires on state_changed → security; runs a
 # per-device interval timer that does take_photo + capture_audio +
 # NDJSON append. Text-only persistence (image / audio bytes discarded;

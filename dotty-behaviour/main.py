@@ -36,7 +36,12 @@ from dispatch import (
 from household import HouseholdRegistry
 from logs import NdjsonWriter
 from perception import PerceptionState
+import re
+
+from calendar_ import CalendarCache
+from calendar_.poll import CalendarPollLoop
 from routes import audio as audio_routes
+from routes import calendar as calendar_routes
 from routes import health as health_routes
 from routes import perception as perception_routes
 from routes import vision as vision_routes
@@ -101,6 +106,22 @@ async def lifespan(app: FastAPI):
     # everyone to `_household`).
     household = HouseholdRegistry(path=config.HOUSEHOLD_YAML_PATH)
     app.state.household = household
+
+    # Weather + calendar cache. Compile the person-prefix regex once
+    # (with fallback to default if the env override is invalid).
+    try:
+        person_prefix_re = re.compile(config.CALENDAR_PERSON_PREFIX_RE)
+    except re.error:
+        log.warning(
+            "invalid CALENDAR_PERSON_PREFIX_RE=%r; using default",
+            config.CALENDAR_PERSON_PREFIX_RE,
+        )
+        person_prefix_re = re.compile(
+            r"^\s*\[(?P<person>[A-Za-z][A-Za-z0-9_-]{0,31})\]\s*(?P<rest>.+)$"
+        )
+    calendar_cache = CalendarCache()
+    app.state.calendar_cache = calendar_cache
+    app.state.calendar_person_prefix_re = person_prefix_re
     # kid-mode default — flipped by the dashboard's kid-mode toggle
     # (deferred slice). vision_explain reads this via get_kid_mode().
     app.state.kid_mode = False
@@ -253,6 +274,26 @@ async def lifespan(app: FastAPI):
     else:
         log.info("security cycle disabled by SECURITY_CYCLE_ENABLED=0")
 
+    # Calendar poll loop alongside the consumers. No-op when no
+    # calendars are configured (CALENDAR_IDS empty).
+    if config.CALENDAR_IDS:
+        consumers.append(
+            CalendarPollLoop(
+                calendar_cache,
+                weather_location=config.WEATHER_LOCATION,
+                weather_ttl_sec=config.WEATHER_TTL_SEC,
+                calendar_ids=config.CALENDAR_IDS,
+                calendar_ttl_sec=config.CALENDAR_TTL_SEC,
+                calendar_sa_path=config.CALENDAR_SA_PATH,
+                gws_bin=config.GWS_BIN,
+                local_tz=config.LOCAL_TZ,
+                household_bucket=config.CALENDAR_HOUSEHOLD_BUCKET,
+                person_prefix_re=person_prefix_re,
+            )
+        )
+    else:
+        log.info("calendar disabled (CALENDAR_ID env empty)")
+
     tasks = [
         asyncio.create_task(c.run(), name=type(c).__name__) for c in consumers
     ]
@@ -287,3 +328,4 @@ app.include_router(perception_routes.router)
 app.include_router(vision_routes.router)
 app.include_router(audio_routes.router)
 app.include_router(voice_routes.router)
+app.include_router(calendar_routes.router)
