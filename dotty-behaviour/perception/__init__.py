@@ -12,6 +12,7 @@ reaching into module globals — keeps the daemon testable in isolation
 the same way `bridge/perception/cache.py` already does for snapshots.
 """
 
+from .notability import is_notable_perception
 from .state import PerceptionEvent, PerceptionState
 from .snapshot import PerceptionSnapshot, snapshot
 
@@ -19,5 +20,6 @@ __all__ = [
     "PerceptionEvent",
     "PerceptionState",
     "PerceptionSnapshot",
+    "is_notable_perception",
     "snapshot",
 ]

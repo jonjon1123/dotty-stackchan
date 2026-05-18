@@ -297,6 +297,24 @@ class PerceptionState:
         for ev in self._audio_waiters.get(device_id, ()):
             ev.set()
 
+    def pick_idle_device(self) -> str | None:
+        """Pick the device the idle photographer should target —
+        priority: most recent vision_cache entry, else first known
+        device in state. Mirrors bridge.py's
+        `_idle_photographer_pick_device`."""
+        if self.vision_cache:
+            try:
+                return max(
+                    self.vision_cache.items(),
+                    key=lambda kv: kv[1].get("wall_ts", 0.0),
+                )[0]
+            except Exception:  # pragma: no cover — defensive
+                pass
+        for did in self.state.keys():
+            if did and did != "unknown":
+                return did
+        return None
+
     def annotate_for_introspection(
         self, devices: Iterable[str] | None = None, *, now: float | None = None
     ) -> dict[str, dict[str, Any]]:

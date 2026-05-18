@@ -18,7 +18,9 @@ from consumers import (
     DanceReflector,
     FaceIdentifiedRefresher,
     FaceLostAborter,
+    IdlePhotographer,
     PurrPlayer,
+    SceneSynthesisLoop,
     SleepDreamer,
     SoundTurner,
     WakeWordTurner,
@@ -170,6 +172,42 @@ async def lifespan(app: FastAPI):
         )
     else:
         log.info("dance reflector disabled by DANCE_REFLECTOR_ENABLED=0")
+
+    if config.IDLE_PHOTOGRAPHER_ENABLED:
+        consumers.append(
+            IdlePhotographer(
+                state,
+                xiaozhi,
+                NdjsonWriter(config.LOG_DIR, "perception", config.LOCAL_TZ),
+                sleep_min_sec=config.IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC,
+                sleep_max_sec=config.IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC,
+                result_wait_sec=config.IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC,
+                notable_jaccard=config.IDLE_PHOTOGRAPHER_NOTABLE_JACCARD,
+                question=config.IDLE_WANDER_PROMPT,
+            )
+        )
+    else:
+        log.info("idle photographer disabled by IDLE_PHOTOGRAPHER_ENABLED=0")
+
+    if config.SCENE_SYNTHESIS_ENABLED:
+        consumers.append(
+            SceneSynthesisLoop(
+                state,
+                NdjsonWriter(
+                    config.LOG_DIR, "scene-synthesis", config.LOCAL_TZ
+                ),
+                interval_sec=config.SCENE_SYNTHESIS_INTERVAL_SEC,
+                min_gap_sec=config.SCENE_SYNTHESIS_MIN_GAP_SEC,
+                trigger_events=config.SCENE_SYNTHESIS_TRIGGER_EVENTS,
+                trigger_states=config.SCENE_SYNTHESIS_TRIGGER_STATES,
+                vision_ttl_sec=config.VISION_CACHE_TTL_SEC,
+                audio_ttl_sec=config.AUDIO_CACHE_TTL_SEC,
+                face_identity_ttl_sec=config.FACE_IDENTITY_TTL_SEC,
+                tz=config.LOCAL_TZ,
+            )
+        )
+    else:
+        log.info("scene synthesis loop disabled by SCENE_SYNTHESIS_ENABLED=0")
 
     tasks = [
         asyncio.create_task(c.run(), name=type(c).__name__) for c in consumers

@@ -29,6 +29,9 @@ class FakeXiaozhi:
     set_face_identified_calls: list[dict[str, Any]] = field(default_factory=list)
     set_toggle_calls: list[dict[str, Any]] = field(default_factory=list)
     play_asset_calls: list[dict[str, Any]] = field(default_factory=list)
+    take_photo_calls: list[dict[str, Any]] = field(default_factory=list)
+    capture_audio_calls: list[dict[str, Any]] = field(default_factory=list)
+    take_photo_result: bool = True
 
     @property
     def configured(self) -> bool:
@@ -78,6 +81,20 @@ class FakeXiaozhi:
     async def play_asset(self, device_id: str, asset: str) -> bool:
         self.play_asset_calls.append(
             {"device_id": device_id, "asset": asset}
+        )
+        return True
+
+    async def take_photo(self, device_id: str, question: str) -> bool:
+        self.take_photo_calls.append(
+            {"device_id": device_id, "question": question}
+        )
+        return self.take_photo_result
+
+    async def capture_audio(
+        self, device_id: str, duration_ms: int = 4000
+    ) -> bool:
+        self.capture_audio_calls.append(
+            {"device_id": device_id, "duration_ms": duration_ms}
         )
         return True
 

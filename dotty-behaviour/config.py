@@ -217,6 +217,58 @@ AUDIO_CAPTION_API_URL: str = os.environ.get(
 AUDIO_CAPTION_TIMEOUT_SEC: float = _env_float("AUDIO_CAPTION_TIMEOUT", 20.0)
 
 
+# ---------------------------------------------------------------------------
+# Idle photographer — silent take_photo every IDLE_PHOTOGRAPHER_SLEEP_*
+# seconds when the device is idle, no face, not listening. Notability
+# gate (Jaccard similarity vs last saved description) suppresses
+# repetitive "same scene" writes.
+# ---------------------------------------------------------------------------
+IDLE_PHOTOGRAPHER_ENABLED: bool = (
+    os.environ.get("IDLE_PHOTOGRAPHER_ENABLED", "1") == "1"
+)
+IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC: float = _env_float(
+    "IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC", 180.0
+)
+IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC: float = _env_float(
+    "IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC", 300.0
+)
+IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC: float = _env_float(
+    "IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC", 20.0
+)
+IDLE_PHOTOGRAPHER_NOTABLE_JACCARD: float = _env_float(
+    "IDLE_PHOTOGRAPHER_NOTABLE_JACCARD", 0.7
+)
+
+IDLE_WANDER_PROMPT: str = (
+    "Describe what you see in 1–3 sentences as a curious robot would "
+    "notice it — light, objects, the room's mood. No people "
+    "identification needed. Stay short and concrete."
+)
+
+# ---------------------------------------------------------------------------
+# Scene synthesis — every SCENE_SYNTHESIS_INTERVAL_SEC (or on trigger
+# events) compose vision_cache + audio_cache + state into a single
+# sentence, append to NDJSON, broadcast a `scene_synthesised` event.
+# MIN_GAP suppresses thrashing when many trigger events arrive in a
+# burst.
+# ---------------------------------------------------------------------------
+SCENE_SYNTHESIS_ENABLED: bool = (
+    os.environ.get("SCENE_SYNTHESIS_ENABLED", "1") == "1"
+)
+SCENE_SYNTHESIS_INTERVAL_SEC: float = _env_float(
+    "SCENE_SYNTHESIS_INTERVAL_SEC", 300.0
+)
+SCENE_SYNTHESIS_MIN_GAP_SEC: float = _env_float(
+    "SCENE_SYNTHESIS_MIN_GAP_SEC", 120.0
+)
+SCENE_SYNTHESIS_TRIGGER_STATES: frozenset[str] = frozenset(
+    {"story_time", "security", "sleep"}
+)
+SCENE_SYNTHESIS_TRIGGER_EVENTS: frozenset[str] = frozenset(
+    {"face_recognized", "audio_captioned", "state_changed"}
+)
+
+
 AUDIO_CAPTION_SYSTEM_PROMPT: str = (
     "You are listening to a short audio clip from a small family "
     "robot's microphone. Describe what you hear in 1–2 sentences. "

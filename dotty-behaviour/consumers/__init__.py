@@ -19,7 +19,9 @@ externalised.
 from .dance_reflector import DanceReflector
 from .face_identified_refresher import FaceIdentifiedRefresher
 from .face_lost_aborter import FaceLostAborter
+from .idle_photographer import IdlePhotographer
 from .purr_player import PurrPlayer
+from .scene_synthesis import SceneSynthesisLoop
 from .sleep_dreamer import SleepDreamer
 from .sound_turner import SoundTurner
 from .wake_word_turner import WakeWordTurner
@@ -28,7 +30,9 @@ __all__ = [
     "DanceReflector",
     "FaceIdentifiedRefresher",
     "FaceLostAborter",
+    "IdlePhotographer",
     "PurrPlayer",
+    "SceneSynthesisLoop",
     "SleepDreamer",
     "SoundTurner",
     "WakeWordTurner",

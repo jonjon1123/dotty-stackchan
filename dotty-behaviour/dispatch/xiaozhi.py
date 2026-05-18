@@ -177,3 +177,34 @@ class XiaozhiAdminClient:
             {"device_id": device_id, "asset": asset},
             label="play-asset",
         )
+
+    async def take_photo(self, device_id: str, question: str) -> bool:
+        """Relay a `self.camera.take_photo` MCP frame to the device.
+
+        The image arrives back at dotty-behaviour via the firmware's
+        usual POST to /api/vision/explain. Callers long-poll
+        /api/vision/latest (or read perception_state.vision_cache
+        directly when in-process) after this returns.
+
+        Returns False if the xiaozhi-server side doesn't yet expose
+        /xiaozhi/admin/take-photo (404). Never raises.
+        """
+        return await self._post(
+            "/xiaozhi/admin/take-photo",
+            {"device_id": device_id, "question": question},
+            label="take-photo",
+        )
+
+    async def capture_audio(
+        self, device_id: str, duration_ms: int = 4000
+    ) -> bool:
+        """Relay a `self.audio.capture_clip` MCP frame.
+
+        Returns False if the relay route is missing. Same loose-contract
+        pattern as take_photo — firmware capture may not yet exist.
+        """
+        return await self._post(
+            "/xiaozhi/admin/capture-audio",
+            {"device_id": device_id, "duration_ms": duration_ms},
+            label="capture-audio",
+        )
