@@ -24,6 +24,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY config.py main.py ./
 COPY perception ./perception
 COPY routes ./routes
+COPY dispatch ./dispatch
+COPY consumers ./consumers
+COPY greeter ./greeter
+COPY household ./household
+COPY logs ./logs
+COPY calendar_ ./calendar_
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
