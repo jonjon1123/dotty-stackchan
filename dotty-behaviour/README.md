@@ -5,17 +5,19 @@ the perception event bus, the 9 ambient-perception consumers, vision
 and audio explain endpoints, the admin dashboard, the proactive
 greeter, and the per-device caches consumed by all of the above.
 
-Sibling of [`dotty-pi`](../dotty-pi/) — together they replace the RPi
-bridge entirely. After this lands the RPi can be powered off.
-
-Tracked under the dotty-behaviour rehoming slice of
+Sibling of [`dotty-pi`](../dotty-pi/) — together they replaced the RPi
+bridge. Cutover executed and RPi powered off **2026-05-19** under
 [#36](https://github.com/BrettKinny/dotty-stackchan/issues/36).
 
 ## What this is
 
 A FastAPI app pinned to `python:3.12-slim-bookworm` running on Unraid
 in `network_mode: host`. xiaozhi-server (same host) talks to it on
-`http://127.0.0.1:8090`. The container is a near-direct lift of
+`http://<XIAOZHI_HOST>:8090` — loopback (`127.0.0.1`) only works if
+xiaozhi-server is also on host networking, which it isn't in the
+current deployment (it's on the `xiaozhi-server_default` bridge net,
+so its loopback resolves to itself). Use the host LAN IP. The
+container is a near-direct lift of
 `bridge.py` + `bridge/*` minus the obsolete `/api/message` /
 `/api/voice/*` / ZeroClaw stdio plumbing that PiVoiceLLM made
 redundant in `#36`.
@@ -94,10 +96,11 @@ Subsequent slices land:
 - Smart-mode model-swap (rewrote RPi-side `~/.zeroclaw/config.toml`)
   — no Unraid equivalent; v2 scope per #36 if it returns.
 
-## Cutover prerequisite
+## Cutover (historical)
 
-xiaozhi-server's `VISION_BRIDGE_URL` env var must change from
-`http://<ZEROCLAW_HOST>:8080` to `http://127.0.0.1:8090`, and
-`custom-providers/xiaozhi-patches/textMessageHandlerRegistry.py` must
-have its perception-event POST URL retargeted the same way. Both land
-in the cutover slice, not the scaffold.
+Cutover landed 2026-05-19. xiaozhi-server's `VISION_BRIDGE_URL` env
+var was flipped from `http://<ZEROCLAW_HOST>:8080` to
+`http://<XIAOZHI_HOST>:8090` (the Unraid LAN IP, not loopback — see
+the networking note above), and the matching `plugins.vision_explain`
+URL in `data/.config.yaml` was flipped the same way. Full runbook +
+lessons-learned in [`docs/cutover-behaviour.md`](../docs/cutover-behaviour.md).

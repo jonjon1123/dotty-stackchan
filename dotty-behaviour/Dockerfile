@@ -31,6 +31,11 @@ COPY household ./household
 COPY logs ./logs
 COPY calendar_ ./calendar_
 
+# Static assets shipped with the image (purr.opus etc). Lives outside /app
+# because PURR_AUDIO_PATH defaults to /var/lib/dotty-behaviour/assets/purr.opus
+# — same parent as the state/logs/secrets bind mounts but not bind-mounted itself.
+COPY assets /var/lib/dotty-behaviour/assets
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DOTTY_BEHAVIOUR_HOST=0.0.0.0 \
