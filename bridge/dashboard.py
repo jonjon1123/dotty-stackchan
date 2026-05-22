@@ -51,6 +51,7 @@ _state: dict[str, Any] = {
     "identity_display_name": None,
     "last_user_line_getter": None,
     "sound_balance_getter": None,
+    "vision_failures_getter": None,
 }
 
 
@@ -67,7 +68,8 @@ def configure(*, send_message: Any = None, vision_cache: dict | None = None,
               perception_recent_getter: Any = None,
               identity_display_name: Any = None,
               last_user_line_getter: Any = None,
-              sound_balance_getter: Any = None) -> None:
+              sound_balance_getter: Any = None,
+              vision_failures_getter: Any = None) -> None:
     """Register bridge state with the dashboard. Idempotent."""
     if send_message is not None:
         _state["send_message"] = send_message
@@ -107,6 +109,8 @@ def configure(*, send_message: Any = None, vision_cache: dict | None = None,
         _state["last_user_line_getter"] = last_user_line_getter
     if sound_balance_getter is not None:
         _state["sound_balance_getter"] = sound_balance_getter
+    if vision_failures_getter is not None:
+        _state["vision_failures_getter"] = vision_failures_getter
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -796,6 +800,19 @@ def _sound_balance_sparkline() -> dict | None:
     }
 
 
+def _vision_failures_count() -> int:
+    """Total vision-capture failures in the last hour (#74) — summed
+    across error kinds. 0 when the getter is unwired or the window is
+    clear."""
+    getter = _state.get("vision_failures_getter")
+    if getter is None:
+        return 0
+    try:
+        return sum(getter().values())
+    except Exception:
+        return 0
+
+
 @router.get("/state", response_class=HTMLResponse, include_in_schema=False)
 async def state_partial(request: Request) -> Any:
     getter = _state.get("state_getter")
@@ -1112,6 +1129,7 @@ def _build_perception_card_ctx(device_id: str | None) -> dict:
         "latest_voice_line": latest_voice_line,
         "synthesis_text": synthesis_text,
         "synthesis_age_label": synthesis_age_label,
+        "vision_failures_1h": _vision_failures_count(),
     }
 
 

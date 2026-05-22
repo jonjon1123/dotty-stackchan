@@ -1714,6 +1714,28 @@ def _sound_balance_series() -> list[float]:
     return [bal for ts, bal in _sound_balance_history if ts >= cutoff]
 
 
+# #74 — vision-capture failures for the dashboard aggregator. (ts, kind)
+# tuples; the getter windows to the last hour and counts by error kind.
+_vision_failures: "collections.deque[tuple[float, str]]" = collections.deque(
+    maxlen=200
+)
+
+
+def _vision_failure_record(kind: str) -> None:
+    """Record a vision-capture failure for the dashboard aggregator (#74)."""
+    _vision_failures.append((time.time(), str(kind or "unknown")))
+
+
+def _vision_failures_last_hour() -> dict[str, int]:
+    """Vision-capture failures in the last hour, counted by error kind."""
+    cutoff = time.time() - 3600.0
+    counts: dict[str, int] = {}
+    for ts, kind in _vision_failures:
+        if ts >= cutoff:
+            counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
 def _perception_subscribe() -> asyncio.Queue:
     q: asyncio.Queue = asyncio.Queue(maxsize=200)
     _perception_listeners.append(q)
@@ -3612,6 +3634,8 @@ async def vision_explain(
         err_kind = "exception"
         raise
     finally:
+        if err_kind:
+            _vision_failure_record(err_kind)
         if _METRICS_AVAILABLE:
             _safe_metric(
                 dotty_request_duration_seconds.labels(
@@ -5066,6 +5090,7 @@ if _configure_dashboard is not None:
         identity_display_name=_identity_display_name,
         last_user_line_getter=_get_last_user_line,
         sound_balance_getter=_sound_balance_series,
+        vision_failures_getter=_vision_failures_last_hour,
     )
 
 
