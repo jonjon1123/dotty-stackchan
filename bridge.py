@@ -3273,6 +3273,21 @@ def _call_narrative_llm(
         return None
 
 
+# `_call_vision_api` never raises — it swallows request/timeout errors and
+# returns one of these sentinel strings, so the upstream LLM receives an
+# explicit "vision is unavailable" instruction instead of confabulating a
+# description. The sentinels double as the dashboard failure-aggregator's
+# classification keys — see `_classify_vision_result` (#74).
+_VISION_ERR_NO_KEY = (
+    "ERROR: my camera is offline right now. Tell the user the vision "
+    "system is unavailable and do not guess at what the photo shows."
+)
+_VISION_ERR_API = (
+    "ERROR: the vision service didn't respond. Tell the user you "
+    "couldn't process the photo and do not guess at what it shows."
+)
+
+
 def _call_vision_api(
     b64_image: str, question: str, *,
     system_prompt: str = VISION_SYSTEM_PROMPT,
@@ -3288,10 +3303,7 @@ def _call_vision_api(
             "VLM call aborted — VLM_API_KEY/VISION_API_KEY/OPENROUTER_API_KEY "
             "all unset; set one in zeroclaw-bridge.service Environment="
         )
-        return (
-            "ERROR: my camera is offline right now. Tell the user the vision "
-            "system is unavailable and do not guess at what the photo shows."
-        )
+        return _VISION_ERR_NO_KEY
     payload = {
         "model": VLM_MODEL,
         "messages": [
@@ -3324,10 +3336,24 @@ def _call_vision_api(
         return resp.json()["choices"][0]["message"]["content"].strip()
     except Exception:
         log.exception("vision API call failed")
-        return (
-            "ERROR: the vision service didn't respond. Tell the user you "
-            "couldn't process the photo and do not guess at what it shows."
-        )
+        return _VISION_ERR_API
+
+
+def _classify_vision_result(text: str | None) -> str | None:
+    """Map a `_call_vision_api` return value to a dashboard failure kind
+    (#74), or None when the call succeeded.
+
+    `_call_vision_api` swallows its own request/timeout exceptions and
+    returns an `ERROR:` sentinel *string* rather than raising — so a dead
+    or unconfigured vision service reaches `vision_explain` as an ordinary
+    return. Without this the aggregator would only ever see the rare
+    `err_kind="exception"` and miss the most common real failure mode:
+    the VLM endpoint not responding."""
+    if text == _VISION_ERR_NO_KEY:
+        return "camera_offline"   # VLM API key unset — a config error
+    if text == _VISION_ERR_API:
+        return "vision_api"       # request failed / non-2xx / bad body
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3628,6 +3654,11 @@ async def vision_explain(
         for k in [k for k, v in _vision_cache.items() if now - v["timestamp"] > VISION_CACHE_TTL_SEC]:
             _vision_cache.pop(k, None)
 
+        # A failed VLM call returns an `ERROR:` sentinel string rather
+        # than raising (see `_call_vision_api`), so classify the final
+        # description for the dashboard failure aggregator (#74) —
+        # otherwise the most common failure mode never reaches the count.
+        err_kind = _classify_vision_result(description)
         log.info("vision result device=%s desc=%s", device_id, description[:120])
         return {"description": description}
     except Exception:
