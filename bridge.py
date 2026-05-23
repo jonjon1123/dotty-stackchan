@@ -1,42 +1,49 @@
+"""Dotty bridge — admin dashboard service (FastAPI on :8081, served at /ui).
+
+Post-#36 incarnation: bridge.py owns the dashboard, the localhost-only
+`/admin/*` mutation surface, Prometheus `/metrics`, and a small set of
+xiaozhi-admin passthrough helpers used by the dashboard buttons (set-state,
+inject-text, abort, kid-mode/smart-mode toggles). Everything else — voice
+turns, perception consumers, vision/audio captioning — moved to dotty-pi
+and dotty-behaviour in the #36 cutover. See docs/cutover-behaviour.md.
+
+History: the file used to be ~6000 lines of voice/perception code wrapped
+around the dashboard mount. Issue #111 ripped the dead code in three
+commits (ACP/voice, perception consumers, VLM/vision/audio) so the
+containerized deploy in PR #109 doesn't double-fire consumers already
+running in dotty-behaviour.
+"""
+
 import asyncio
-import base64
-import collections
-import functools
-import itertools
 import json
 import logging
 import os
-import random
 import re
-import requests
 import sys
 import time
-import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
-from time import perf_counter
-from typing import Awaitable, Callable, Optional, TypedDict
-from zoneinfo import ZoneInfo
+from typing import Any
 
 # Sibling import shim — custom-providers/textUtils.py is the canonical
 # home for safety/format constants (also bind-mounted into the xiaozhi
-# container as core.utils.textUtils, where the LLM provider files
-# import it). Bridge runs outside the container so it imports it as
-# a sibling. Drop this if/when bridge becomes a proper package.
+# container as core.utils.textUtils). Bridge runs outside the container
+# so it imports it as a sibling. Drop this if/when bridge becomes a
+# proper package.
 sys.path.insert(0, str(Path(__file__).parent / "custom-providers"))
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+import requests
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from textUtils import (
+from textUtils import (  # noqa: F401  (re-exported for downstream tools)
     ALLOWED_EMOJIS,
     FALLBACK_EMOJI,
     build_turn_suffix,
 )
 
 from bridge.csrf import CSRFMiddleware
-from bridge.text import (
+from bridge.text import (  # noqa: F401  (used by bridge.dashboard via re-imports)
     CONTENT_FILTER_REPLACEMENT,
     MAX_SENTENCES,
     clean_for_tts,
@@ -46,85 +53,42 @@ from bridge.text import (
     truncate_sentences,
 )
 
-# Observability — every metric call is wrapped in `_safe_metric(...)` so a
-# bug in metrics wiring can NEVER break the request path. The metrics
-# module also degrades to no-ops if prometheus_client is unavailable.
-# Privacy-LED upload-pulse signaller — wraps cloud vision calls so the
-# firmware can pulse the camera privacy LED while data is in flight.
-# Today no transport is wired (avatar WS server isn't deployed); the
-# helper is a no-op-with-debug-log fallback so the call sites are ready
-# the moment a transport is plugged in. Firmware enforces a 2 s failsafe
-# timeout, so a missing `end` is self-healing.
-
 try:
     from bridge.metrics import (
-        dotty_active_acp_sessions,
-        dotty_calendar_fetch_failures_total,
         dotty_kid_mode_active,
-        dotty_perception_events_total,
-        dotty_request_duration_seconds,
-        dotty_request_errors_total,
         metrics_app,
-        record_first_audio,
     )
     _METRICS_AVAILABLE = True
 except Exception:  # pragma: no cover
     _METRICS_AVAILABLE = False
     metrics_app = None  # type: ignore[assignment]
-    def record_first_audio(_seconds: float) -> None:  # type: ignore[no-redef]
-        return None
 
 
 def _safe_metric(fn, *args, **kwargs) -> None:
-    """Run a metrics-mutating callable, swallowing any exception.
-
-    Counter/Gauge/Histogram methods rarely raise, but we still guard the
-    call site because this code runs on the live voice path. A broken
-    metric must never take down a turn.
-    """
+    """Run a metrics-mutating callable, swallowing any exception."""
     try:
         fn(*args, **kwargs)
     except Exception:
-        # Use debug — we don't want a noisy log every request if a label
-        # name is mistyped. The /metrics endpoint surface still works.
-        logging.getLogger("zeroclaw-bridge").debug(
+        logging.getLogger("dotty-bridge").debug(
             "metric update raised; ignoring", exc_info=True,
         )
 
-ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/root/.cargo/bin/zeroclaw")
-REQUEST_TIMEOUT_SEC = float(os.environ.get("ZEROCLAW_TIMEOUT", "90"))
-INIT_TIMEOUT_SEC = float(os.environ.get("ZEROCLAW_INIT_TIMEOUT", "10"))
-STOP_TIMEOUT_SEC = 2.0
-SESSION_IDLE_TIMEOUT_SEC = float(os.environ.get("ZEROCLAW_SESSION_IDLE", "300"))
-SESSION_MAX_TURNS = int(os.environ.get("ZEROCLAW_SESSION_MAX_TURNS", "50"))
-SESSION_MAX_AGE_SEC = float(os.environ.get("ZEROCLAW_SESSION_MAX_AGE_SEC", "1800"))
+
+# ---------------------------------------------------------------------------
+# Kid-mode + smart-mode state files
+# ---------------------------------------------------------------------------
+
 _KID_STATE_FILE = Path(
     os.environ.get("DOTTY_KID_MODE_STATE", "/root/zeroclaw-bridge/state/kid-mode")
 )
-# Voice-daemon LLM is selected by `smart_mode` only. kid_mode is orthogonal —
-# guardrails (content sandwich, denied tools, persona) are independent of the
-# model. smart_mode OFF → DEFAULT_MODEL. smart_mode ON → SMART_MODEL.
-#
-# Multi-profile mode (optional, opt-in): when DEFAULT_MODEL and SMART_MODEL
-# live behind different provider URLs (e.g. local Ollama for default, cloud
-# OpenRouter for smart), set VOICE_LOCAL_PROFILE_KEY to the local profile's
-# `[providers.models.<KEY>]` section key. Smart-mode swap then rewrites the
-# model AND repoints `[providers].fallback` between the two profiles.
-# Without these env vars, the legacy single-section behavior is used (both
-# IDs assumed routable through one custom provider, e.g. OpenRouter).
-DEFAULT_MODEL = os.environ.get(
-    "DOTTY_DEFAULT_MODEL", "mistralai/mistral-small-3.2-24b-instruct",
-)
-VOICE_LOCAL_PROFILE_KEY = os.environ.get("VOICE_LOCAL_PROFILE_KEY", "")
-VOICE_CLOUD_PROFILE_KEY = os.environ.get(
-    "VOICE_CLOUD_PROFILE_KEY", "custom:https://openrouter.ai/api/v1",
+_SMART_STATE_FILE = Path(
+    os.environ.get("DOTTY_SMART_MODE_STATE", "/root/zeroclaw-bridge/state/smart-mode")
 )
 
 
 def _read_kid_mode() -> bool:
     """State file overrides env var so the dashboard can flip kid-mode and
-    survive a restart without editing the systemd unit. Format: "true" or
-    "false" (any other content falls back to the env default)."""
+    survive a restart without editing the unit. Format: "true" or "false"."""
     if _KID_STATE_FILE.exists():
         try:
             v = _KID_STATE_FILE.read_text().strip().lower()
@@ -144,66 +108,23 @@ def _write_kid_mode(enabled: bool) -> None:
         _safe_metric(dotty_kid_mode_active.set, 1 if enabled else 0)
 
 
-def _build_vision_system_prompt(kid: bool) -> str:
-    return (
-        "You are describing a photo taken by a small robot's camera (low resolution). "
-        + ("Describe what you see in simple, clear language suitable for a young child. "
-           "Focus on objects, colors, and actions. Do NOT identify or name specific people. "
-           "If the image contains anything inappropriate for young children, "
-           "say only 'I see something I am not sure about' without further detail. "
-           if kid else
-           "Describe what you see clearly and concisely. "
-           "Focus on objects, people, colors, and actions. ")
-        + "If the image is blurry or unclear, describe what you can make out. "
-        "Keep your description to 2-3 sentences."
-    )
-
-
-def _build_voice_turn_suffix_short(kid: bool) -> str:
-    # Slim per-turn reminder. The heavy framing (kid topic guards, jailbreak
-    # resistance, age-appropriate language) lives in the persona file now,
-    # which Ollama prefix-caches across turns. This suffix only repeats the
-    # rules Qwen3-4B drifts on first: language, emoji, format, length.
-    return (
-        "\n\n[Rules: ENGLISH only, one leading emoji from 😊😆😢😮🤔😠😐😍😴, "
-        "no markdown, 1-2 sentences (up to 6 if open-ended). Begin now.]"
-    )
-
-
 def _apply_kid_mode(enabled: bool) -> None:
     """Rebind every kid_mode-derived module global in one atomic pass.
 
-    Called once at module import and again on each dashboard / admin toggle
-    so the bridge can hot-reload kid_mode without a daemon restart. Each
-    rebinding is a single STORE_GLOBAL — readers see either the old or new
-    value, never a torn intermediate. Per-turn lookup cost is unchanged
-    (still a module-attribute read; no function-call frame added)."""
-    global KID_MODE, VISION_SYSTEM_PROMPT, MCP_TOOL_DENYLIST
-    global VOICE_TURN_SUFFIX, VOICE_TURN_SUFFIX_SHORT
+    Called once at module import and again on each dashboard / admin
+    toggle. Each rebinding is a single STORE_GLOBAL — readers see either
+    the old or new value, never a torn intermediate. Kept slim post-#36:
+    only the bits the live dashboard / admin surface reads."""
+    global KID_MODE, VOICE_TURN_SUFFIX
     KID_MODE = enabled
-    VISION_SYSTEM_PROMPT = _build_vision_system_prompt(enabled)
-    MCP_TOOL_DENYLIST = {"camera.take_photo"} if enabled else set()
     VOICE_TURN_SUFFIX = build_turn_suffix(enabled)
-    VOICE_TURN_SUFFIX_SHORT = _build_voice_turn_suffix_short(enabled)
 
 
 KID_MODE: bool = False
-VISION_SYSTEM_PROMPT: str = ""
-MCP_TOOL_DENYLIST: set[str] = set()
 VOICE_TURN_SUFFIX: str = ""
-VOICE_TURN_SUFFIX_SHORT: str = ""
 _apply_kid_mode(_read_kid_mode())
 if _METRICS_AVAILABLE:
     _safe_metric(dotty_kid_mode_active.set, 1 if KID_MODE else 0)
-
-
-# smart_mode toggle persistence. ON swaps the voice daemon's model to
-# SMART_MODEL (claude-sonnet-4-6), OFF restores DEFAULT_MODEL (mistral).
-# Daemon reload happens on each toggle. State file persists the bit across
-# reconnects so the bridge knows which model to load at boot.
-_SMART_STATE_FILE = Path(
-    os.environ.get("DOTTY_SMART_MODE_STATE", "/root/zeroclaw-bridge/state/smart-mode")
-)
 
 
 def _read_smart_mode() -> bool:
@@ -223,109 +144,24 @@ def _write_smart_mode(enabled: bool) -> None:
     _SMART_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _SMART_STATE_FILE.write_text("true" if enabled else "false")
 
-LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "Australia/Brisbane"))
-WEATHER_LOCATION = os.environ.get("WEATHER_LOCATION", "Brisbane")
 
-WEATHER_TTL_SEC = float(os.environ.get("WEATHER_TTL_SEC", "1800"))
-CALENDAR_TTL_SEC = float(os.environ.get("CALENDAR_TTL_SEC", "7200"))
-CALENDAR_IDS = [c.strip() for c in os.environ.get("CALENDAR_ID", "").split(",") if c.strip()]
-CALENDAR_SA_PATH = os.environ.get(
-    "CALENDAR_SA_PATH", "/root/.zeroclaw/secrets/google-calendar-sa.json",
-)
-GWS_BIN = os.environ.get("GWS_BIN", "/usr/local/bin/gws")
-# Background-poll cadence for the calendar cache refresher. 900 s (15 min)
-# is well below CALENDAR_TTL_SEC so transient gws/network failures don't
-# leave a stale cache visible for the full TTL window.
-CALENDAR_POLL_SEC = float(os.environ.get("CALENDAR_POLL_SEC", "900"))
-# Bucket name for events whose summary has no `[Person]` prefix tag. The
-# "_" leading underscore makes it impossible to collide with a real first
-# name typed into a calendar event.
-CALENDAR_HOUSEHOLD_BUCKET = os.environ.get("CALENDAR_HOUSEHOLD_BUCKET", "_household")
-# Regex applied to event summaries to extract a person tag. Must define
-# named groups `person` and `rest`. Default matches `[Name] real summary`
-# where Name is 1-32 chars of [A-Za-z0-9_-] starting with a letter.
-CALENDAR_PERSON_PREFIX_RE = os.environ.get(
-    "CALENDAR_PERSON_PREFIX_RE",
-    r"^\s*\[(?P<person>[A-Za-z][A-Za-z0-9_-]{0,31})\]\s*(?P<rest>.+)$",
-)
-try:
-    _CALENDAR_PERSON_RE = re.compile(CALENDAR_PERSON_PREFIX_RE)
-except re.error:
-    logging.getLogger("zeroclaw-bridge").warning(
-        "invalid CALENDAR_PERSON_PREFIX_RE=%r; falling back to default",
-        CALENDAR_PERSON_PREFIX_RE,
-    )
-    _CALENDAR_PERSON_RE = re.compile(
-        r"^\s*\[(?P<person>[A-Za-z][A-Za-z0-9_-]{0,31})\]\s*(?P<rest>.+)$"
-    )
-VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-2.0-flash-001")
-VISION_API_KEY = os.environ.get("VISION_API_KEY", os.environ.get("OPENROUTER_API_KEY", ""))
-VISION_API_URL = os.environ.get(
-    "VISION_API_URL", "https://openrouter.ai/api/v1/chat/completions",
-)
-VISION_TIMEOUT_SEC = float(os.environ.get("VISION_TIMEOUT", "15"))
-VISION_CACHE_TTL_SEC = 60.0
-# VLM endpoint — defaults to the legacy VISION_* values so existing setups
-# keep working. Split out so the actual visual model can be routed locally
-# (e.g. Ollama Qwen2.5-VL) while VISION_API_URL still serves the cloud-
-# routed narrative LLM (`_call_narrative_llm`).
-VLM_MODEL = os.environ.get("VLM_MODEL", VISION_MODEL)
-VLM_API_KEY = os.environ.get("VLM_API_KEY", VISION_API_KEY)
-VLM_API_URL = os.environ.get("VLM_API_URL", VISION_API_URL)
-# Audio captioning — security-grade "what does Dotty hear" describer.
-# Defaults to a Gemini model that accepts the OpenAI-style `input_audio`
-# content-block via OpenRouter; override AUDIO_CAPTION_MODEL if your
-# OpenRouter account routes audio elsewhere. Reuses VISION_API_KEY by
-# default so a single OpenRouter key covers both modalities.
-AUDIO_CAPTION_MODEL = os.environ.get(
-    "AUDIO_CAPTION_MODEL", "google/gemini-2.5-flash",
-)
-AUDIO_CAPTION_API_KEY = os.environ.get(
-    "AUDIO_CAPTION_API_KEY",
-    os.environ.get("VISION_API_KEY", os.environ.get("OPENROUTER_API_KEY", "")),
-)
-AUDIO_CAPTION_API_URL = os.environ.get(
-    "AUDIO_CAPTION_API_URL",
-    "https://openrouter.ai/api/v1/chat/completions",
-)
-AUDIO_CAPTION_TIMEOUT_SEC = float(os.environ.get("AUDIO_CAPTION_TIMEOUT", "20"))
-AUDIO_CACHE_TTL_SEC = 120.0
-# Periodic synthesis of "current environment" — vision desc + audio
-# caption + face/state — into a one-line text record. Phase A sink is
-# a daily NDJSON ring file under CONVO_LOG_DIR; ZeroClaw-side ingestion
-# into FTS memory is Phase C (separate change).
-SCENE_SYNTHESIS_INTERVAL_SEC = float(
-    os.environ.get("SCENE_SYNTHESIS_INTERVAL_SEC", "300")
-)
-SCENE_SYNTHESIS_MIN_GAP_SEC = float(
-    os.environ.get("SCENE_SYNTHESIS_MIN_GAP_SEC", "120")
-)
-SCENE_SYNTHESIS_TRIGGER_STATES = {"story_time", "security", "sleep"}
+# ---------------------------------------------------------------------------
+# Tier1Slim hot-swap env (smart-mode flip target on the live xiaozhi-server)
+# ---------------------------------------------------------------------------
+# DOTTY_VOICE_PROVIDER=tier1slim is the post-#36 voice provider; smart_mode
+# flips its model/url/api_key via /xiaozhi/admin/set-tier1slim-model rather
+# than restarting a daemon. Legacy "zeroclaw" config.toml-rewrite path was
+# retired with the rest of the ZeroClaw stack — keep the helper for parity
+# but the only live target is tier1slim.
+
 SMART_MODEL = os.environ.get("SMART_MODEL", "anthropic/claude-sonnet-4-6")
+DOTTY_VOICE_PROVIDER = os.environ.get("DOTTY_VOICE_PROVIDER", "tier1slim").strip().lower()
 
-# Voice provider selector. Default ("zeroclaw") preserves the legacy
-# _apply_model_swap path (rewrite /root/.zeroclaw/config.toml + restart
-# zeroclaw-bridge). Set to "tier1slim" when xiaozhi-server's Tier1Slim
-# provider owns the voice path — smart_mode then hot-swaps Tier1Slim's
-# model/url/api_key in place via /xiaozhi/admin/set-tier1slim-model.
-DOTTY_VOICE_PROVIDER = os.environ.get("DOTTY_VOICE_PROVIDER", "zeroclaw").strip().lower()
-# Local backend (smart_mode OFF) — llama-swap on Unraid running the
-# slim model (qwen3.5:4b is what Tier1Slim invokes; the 27B is reached
-# downstream by think_hard via bridge, not directly). URL must include
-# the OpenAI-compat /v1 suffix. Defaults match data/.config.yaml on the
-# live xiaozhi-server.
 TIER1SLIM_LOCAL_URL = os.environ.get(
     "TIER1SLIM_LOCAL_URL", "http://localhost:8080/v1",
 )
 TIER1SLIM_LOCAL_API_KEY = os.environ.get("TIER1SLIM_LOCAL_API_KEY", "dotty-voice")
 TIER1SLIM_LOCAL_MODEL = os.environ.get("TIER1SLIM_LOCAL_MODEL", "qwen3.5:4b")
-# Cloud backend (smart_mode ON) — OpenRouter, model defaults to SMART_MODEL.
-# api_key MUST be set explicitly via TIER1SLIM_CLOUD_API_KEY in the systemd
-# unit (or as OPENROUTER_API_KEY) — the bridge has no other path to the key
-# (ZeroClaw stores it encrypted). Empty key → admin endpoint will refuse to
-# blank api_key on the live provider, so the OFF→ON flip will fail with a
-# clean error rather than 401-loop. Local→cloud requires this; cloud→local
-# does not.
 TIER1SLIM_CLOUD_URL = os.environ.get(
     "TIER1SLIM_CLOUD_URL", "https://openrouter.ai/api/v1",
 )
@@ -336,1567 +172,25 @@ TIER1SLIM_CLOUD_API_KEY = os.environ.get(
 
 def _tier1slim_target_for_smart_mode(enabled: bool) -> tuple[str, str, str]:
     """Return (model, url, api_key) for the Tier1Slim runtime swap given
-    the desired smart_mode state. ON → cloud (Sonnet via OpenRouter),
-    OFF → local llama-swap."""
+    the desired smart_mode state. ON → cloud, OFF → local llama-swap."""
     if enabled:
         return (SMART_MODEL, TIER1SLIM_CLOUD_URL, TIER1SLIM_CLOUD_API_KEY)
     return (TIER1SLIM_LOCAL_MODEL, TIER1SLIM_LOCAL_URL, TIER1SLIM_LOCAL_API_KEY)
-CONVO_LOG_DIR = Path(os.environ.get("CONVO_LOG_DIR", "/root/zeroclaw-bridge/logs"))
-# Used by the dashboard admin path AND by perception-bus consumers (1.5/1.6).
-# Hoisted out of the `if _configure_dashboard` block so the bus tasks can
-# reach the xiaozhi admin endpoints regardless of dashboard availability.
+
+
+# ---------------------------------------------------------------------------
+# xiaozhi-server admin passthrough helpers — dashboard buttons
+# ---------------------------------------------------------------------------
+# These wrap POSTs at /xiaozhi/admin/* on the local xiaozhi-server. The
+# dashboard never talks to xiaozhi directly; it goes through these so the
+# bridge can layer state-file + metric updates around the call.
+
 _XIAOZHI_HOST = os.environ.get("XIAOZHI_HOST", "")
 _XIAOZHI_HTTP_PORT = int(os.environ.get("XIAOZHI_OTA_PORT", "8003"))
-# Phase 1.5: face-greet cooldown. Conservative default keeps the robot
-# from re-greeting on every casual walk-by while still re-engaging when
-# the user comes back after a real absence.
-#
-# `FACE_GREET_MIN_INTERVAL_SEC` is the new canonical name (the brief in
-# tasks.md tracks coexistence with the firmware-side WakeWordInvoke).
-# `FACE_GREET_COOLDOWN_SEC` is honoured for back-compat with existing
-# deployments — set either one. New default is 30 s; existing 60 s
-# overrides remain in force if the legacy name is set.
-FACE_GREET_MIN_INTERVAL_SEC = float(
-    os.environ.get(
-        "FACE_GREET_MIN_INTERVAL_SEC",
-        os.environ.get("FACE_GREET_COOLDOWN_SEC", "30"),
-    )
-)
-# Back-compat alias kept so existing references keep compiling. New code
-# should reference FACE_GREET_MIN_INTERVAL_SEC directly.
-FACE_GREET_COOLDOWN_SEC = FACE_GREET_MIN_INTERVAL_SEC
-# `FACE_GREET_TEXT=""` (empty string) DISABLES the verbal greet entirely
-# — the firmware-side WakeWordInvoke("face") still opens the mic, so the
-# robot acknowledges the person silently with a chime + listen window.
-# Default "Hi!" keeps the warmer "verbal + mic" combo.
-FACE_GREET_TEXT = os.environ.get("FACE_GREET_TEXT", "Hi!")
-# Suppress the bare "Hi!" greet outside daytime hours so sensor-noise
-# frames in low light can't trigger a 3 AM "Hi!". Half-open: greets fire
-# when START <= local_hour < END. Default 06–21 (LOCAL_TZ). Set START=0
-# END=24 to greet 24/7.
-FACE_GREET_HOUR_START = int(os.environ.get("FACE_GREET_HOUR_START", "6"))
-FACE_GREET_HOUR_END = int(os.environ.get("FACE_GREET_HOUR_END", "21"))
-
-# Named-recognition acknowledger. Fires on `face_recognized` (after the
-# room-view VLM resolves to a roster member) so the user hears explicit
-# proof of recognition. Independent of the bare "Hi!" greeter and of the
-# rich ProactiveGreeter (which is 4h-cooldown'd and may not fire). No
-# time-of-day gate — recognition confirmation should not be silenced.
-FACE_NAME_GREET_MIN_INTERVAL_SEC = float(
-    os.environ.get("FACE_NAME_GREET_MIN_INTERVAL_SEC", "30"),
-)
-FACE_NAME_GREET_TEMPLATE = os.environ.get(
-    "FACE_NAME_GREET_TEMPLATE", "Oh, it's {name}!",
-)
-# Suppress the named greet if a chat happened within this many seconds.
-# Mirrors the sound_turner's last_chat_t gate so the upgrade doesn't
-# stomp the tail of an in-flight TTS turn.
-FACE_NAME_GREET_QUIET_AFTER_CHAT_SEC = float(
-    os.environ.get("FACE_NAME_GREET_QUIET_AFTER_CHAT_SEC", "10"),
-)
-# How long a freshly identified person stays "identified" in bridge state
-# after their last face_recognized event. Spans the natural detection flicker
-# (HuMan model drops out across pose/exposure changes; firmware grace is only
-# 800 ms) so the dashboard chip + talk-turn perception don't collapse to
-# "unrecognised" the first time the bbox blinks. Cleared eagerly on real
-# departures via the refresh loop's freshness check, not on every face_lost.
-FACE_IDENTITY_TTL_SEC = float(
-    os.environ.get("FACE_IDENTITY_TTL_SEC", "30"),
-)
-# Cadence of the periodic set_face_identified MCP refresh while the same
-# person stays in frame. Firmware's identified-pip self-timeout is ~4 s; a
-# 3 s refresh keeps the green pip continuously lit without racing the
-# timeout. Refresh stops once last_face_recognized_t goes stale (TTL above)
-# or the firmware reports face genuinely lost for >FACE_IDENTITY_REFRESH_QUIET_SEC.
-FACE_IDENTITY_REFRESH_INTERVAL_SEC = float(
-    os.environ.get("FACE_IDENTITY_REFRESH_INTERVAL_SEC", "3.0"),
-)
-# How long after a face_lost the refresh loop will keep firing. Bridges the
-# detection flicker without lighting the pip for an empty room.
-FACE_IDENTITY_REFRESH_QUIET_SEC = float(
-    os.environ.get("FACE_IDENTITY_REFRESH_QUIET_SEC", "2.0"),
-)
-
-# Idle photo cooldown. Autonomous (firmware-initiated, room-view sentinel)
-# photo captures are rate-limited per device to avoid thrashing the VLM
-# every time a face is detected. Voice queries ("what do you see") bypass.
-# A "no photos while talking" hard gate belongs in firmware ModeManager
-# (Phase 4) since the bridge has no real-time TTS state visibility.
-DOTTY_IDLE_VISION_COOLDOWN_SEC = float(
-    os.environ.get("DOTTY_IDLE_VISION_COOLDOWN_SEC", "120"),
-)
-# Talk-active gate kickoff allowance. The xiaozhi-side handler dispatches
-# the room_view capture while state is still `idle`; the JPEG arrives at
-# the bridge ~2-3 s later, by which time the firmware has auto-transitioned
-# to `talk` (face_tracking → WakeWordInvoke). Without an allowance the
-# kickoff capture — the only photo for that conversation's greeting — is
-# gated to the "no one in view" stub. Subsequent face_detected events
-# during the same turn arrive well after this window and stay gated.
-ROOM_VIEW_TALK_KICKOFF_GRACE_SEC = float(
-    os.environ.get("ROOM_VIEW_TALK_KICKOFF_GRACE_SEC", "5.0"),
-)
-# Idle photographer — fires a silent take_photo every IDLE_PHOTOGRAPHER_*
-# seconds (uniform jitter) while the device is genuinely idle. No servo
-# motion, no LED change, no audio cue. The capture itself is identical
-# to a face-driven room view; the difference is the trigger and the
-# wandering prompt. Disable by setting IDLE_PHOTOGRAPHER_ENABLED=0.
-IDLE_PHOTOGRAPHER_ENABLED = (
-    os.environ.get("IDLE_PHOTOGRAPHER_ENABLED", "1") == "1"
-)
-IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC = float(
-    os.environ.get("IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC", "180"),
-)
-IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC = float(
-    os.environ.get("IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC", "300"),
-)
-# Wait window after dispatching `take_photo` before reading the cache.
-# Firmware capture + upload + VLM round-trip is typically ~5–10 s; pad
-# generously since this loop is fully async and a missed cycle just
-# means we try again in 3–5 min.
-IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC = float(
-    os.environ.get("IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC", "20"),
-)
-# Token-set Jaccard similarity threshold above which a new perception
-# is considered "the same" as the previous saved one and skipped. 0.7
-# tolerates a couple of changed words; tune up to suppress more, down
-# to save more.
-IDLE_PHOTOGRAPHER_NOTABLE_JACCARD = float(
-    os.environ.get("IDLE_PHOTOGRAPHER_NOTABLE_JACCARD", "0.7"),
-)
-
-# Narrative LLM — used for non-conversational internal writes (dreams,
-# dance reflections, future story summaries). These are introspective
-# narratives Dotty writes about their own experience, not voice output;
-# they bypass the ZeroClaw / kid-mode sandwich entirely. Routes through
-# the same OpenRouter endpoint as the VLM call.
-NARRATIVE_MODEL = os.environ.get(
-    "NARRATIVE_MODEL", "anthropic/claude-sonnet-4-6",
-)
-NARRATIVE_TIMEOUT_SEC = float(os.environ.get("NARRATIVE_TIMEOUT_SEC", "60"))
-
-# Sleep dreamer cadence. Three dreams scheduled at 25/50/75% of an
-# estimated 8h sleep window. Bench-test by overriding
-# DREAM_WINDOW_SECONDS (e.g. 180 = 3 min, fires at 45/90/135 s).
-DREAM_WINDOW_SECONDS = float(os.environ.get("DREAM_WINDOW_SECONDS", "28800"))
-DREAM_COUNT_PER_NIGHT = int(os.environ.get("DREAM_COUNT_PER_NIGHT", "3"))
-DREAMER_ENABLED = os.environ.get("DREAMER_ENABLED", "1") == "1"
-DANCE_REFLECTOR_ENABLED = (
-    os.environ.get("DANCE_REFLECTOR_ENABLED", "1") == "1"
-)
-
-# Sci-fi literary seeds for the dream prompt. The dreamer picks one
-# uniformly at random per dream; the LLM is asked to draw on the
-# seed's atmosphere without retelling it. Extend by appending; one
-# string per seed.
-DREAM_INSPIRATIONS: tuple[str, ...] = (
-    "The Fifth Element",
-    "Murakami",
-    "Dune",
-    "Blade Runner",
-    "Do Androids Dream of Electric Sheep?",
-    "Asimov",
-    "The Last Question",
-    "Slaughterhouse-Five",
-    "Cat's Cradle",
-)
-# How recently must a greeting have fired for face_lost to abort it.
-# Firmware emits face_lost ~2 s after the face actually leaves frame
-# (FaceTrackingModifier grace period); past this window we assume the
-# greeting / response cycle has wrapped up naturally.
-FACE_LOST_ABORT_WINDOW_SEC = float(
-    os.environ.get("FACE_LOST_ABORT_WINDOW_SEC", "12"))
-# Debounce delay before the abort actually fires. The firmware face
-# detector trips face_lost on small head movements, blinks, or brief
-# occlusion — without a grace period, the aborter kills the greet/listen
-# cycle every time the user shifts in their seat. If face_detected
-# returns within the grace window, the pending abort is cancelled.
-FACE_LOST_ABORT_GRACE_SEC = float(
-    os.environ.get("FACE_LOST_ABORT_GRACE_SEC", "4"))
-# Phase 1.6: head-turn cooldown so the servos don't whip back and forth
-# on rapid sound bursts. 3 s is roughly the time a deliberate noise
-# (clap, doorbell) takes to register and have the user notice the head
-# move toward it.
-SOUND_TURN_COOLDOWN_SEC = float(os.environ.get("SOUND_TURN_COOLDOWN_SEC", "3"))
-# Yaw mapping for sound direction. Conservative angles so the gaze is
-# obvious without overshooting; the firmware MCP head-angles call
-# clamps to its own limits.
-SOUND_TURN_YAW_DEG = int(os.environ.get("SOUND_TURN_YAW_DEG", "45"))
-SOUND_TURN_SPEED = int(os.environ.get("SOUND_TURN_SPEED", "250"))
-# Wake-word-bound head turn: deliberate engagement, faster motion, no
-# cooldown. Distinct intent from the ambient sound turner above —
-# this fires when the user explicitly summons Dotty. Skipped when a
-# face is already being tracked (face_tracking modifier owns the gaze
-# in that case). Skipped on direction=centre (no spatial info to act on).
-WAKE_TURN_ENABLED = os.environ.get("WAKE_TURN_ENABLED", "1") not in ("0", "false", "False")
-WAKE_TURN_YAW_DEG = int(os.environ.get("WAKE_TURN_YAW_DEG", "45"))
-WAKE_TURN_SPEED = int(os.environ.get("WAKE_TURN_SPEED", "200"))
-# ---------------------------------------------------------------------------
-# Purr-on-head-pet (server-pushed, Option B)
-# ---------------------------------------------------------------------------
-# When the firmware emits a `head_pet_started` perception event, the bridge
-# pushes a pre-rendered purr clip from bridge/assets/purr.opus. This is a
-# fixed-audio asset path — kid-mode content filtering does NOT apply because
-# the bytes are curated, not LLM-generated (see bridge/assets/README.md).
-# Per-device cooldown stops a continuous head-pet from re-triggering the
-# clip on every event burst.
-PURR_AUDIO_PATH = Path(
-    os.environ.get("PURR_AUDIO_PATH", "bridge/assets/purr.opus")
-)
-PURR_COOLDOWN_SEC = float(os.environ.get("PURR_COOLDOWN_SEC", "5"))
-# Approximate playback duration. We extend the device's `last_chat_t` for
-# this many seconds while the purr plays so the sound localizer doesn't
-# turn the head toward the speaker mid-purr (see _perception_sound_turner
-# which checks last_chat_t to suppress turns during talking).
-PURR_DURATION_SEC = float(os.environ.get("PURR_DURATION_SEC", "2.0"))
-# VISION_SYSTEM_PROMPT is set by `_apply_kid_mode` at module init and on
-# each toggle (see `_build_vision_system_prompt`).
-# Room-view (description + roster identification) system prompt. Used
-# only when the question field carries the _ROOM_VIEW_SENTINEL value
-# below — the bridge then substitutes a roster-aware question with
-# the household members inlined. The "name only from this list, else
-# unknown" framing makes the kid-mode "do not name people" guard
-# unnecessary: the VLM can only emit one of the four roster names or
-# "unknown", so a stranger or hallucinated name is structurally
-# impossible to leak to the LLM downstream.
-VISION_ROOM_VIEW_SYSTEM_PROMPT = (
-    "You are looking at a photo from a small family robot's camera. "
-    "Reply in the EXACT format the user message requests. "
-    "Identify the person ONLY by names from the list the user provides. "
-    "Never invent names; never name anyone outside the list. "
-    "If you are not confident or no match is clear, use the name 'unknown'. "
-    "Keep the description to one short sentence. "
-    "Read the person's apparent mood from face + posture only, choosing "
-    "from a fixed vocabulary."
-)
-# Security-framed audio captioning prompt. Used by /api/audio/explain
-# whenever no caller-supplied prompt overrides it. The framing biases the
-# model toward calling out anything unusual — raised voices, distress,
-# breaking glass, alarms, impacts — while still naming ordinary speech
-# or ambient sounds briefly. Paraphrases speech rather than transcribing
-# verbatim so the cached description doesn't double as a covert
-# transcript log.
-AUDIO_CAPTION_SYSTEM_PROMPT = (
-    "You are listening to a short audio clip from a small family robot's microphone. "
-    "Describe what you hear in 1–2 sentences. "
-    "Note speech (paraphrase briefly, do not transcribe verbatim), music, and ambient sounds. "
-    "Especially flag anything unusual — raised voices, distress, breaking glass, "
-    "alarms, impacts, or sudden loud noises — at the start of your reply. "
-    "If the clip is normal ambient sound or quiet conversation, say so briefly. "
-    "Do not invent details you cannot hear."
-)
-# Sentinel value placed in the multipart `question` field by the
-# xiaozhi-side `_capture_room_description_async` to opt in to the
-# roster-aware path. The bridge owns the actual prompt + roster
-# (which lives in `~/.zeroclaw/household.yaml` on the bridge host),
-# so the xiaozhi side has no roster knowledge — it just signals
-# intent. Versioning is in the sentinel itself for future format
-# revs (`__ROOM_VIEW_V2__` etc.).
-_ROOM_VIEW_SENTINEL = "__ROOM_VIEW_V1__"
-
-# Idle photographer wandering prompt — sent as the `question` to
-# `take_photo`, which the firmware passes back to /api/vision/explain
-# as the VLM user-prompt. No people identification (the room-view
-# roster path handles that on face_detected). Curious framing,
-# concrete language; the bridge-side notability filter handles
-# repetition suppression.
-IDLE_WANDER_PROMPT = (
-    "Describe what you see in 1–3 sentences as a curious robot would "
-    "notice it — light, objects, the room's mood. No people identification "
-    "needed. Stay short and concrete."
-)
-
-# ---------------------------------------------------------------------------
-# MCP tool permission policy
-# ---------------------------------------------------------------------------
-# Tools the firmware advertises via WebSocket handshake. Names use the firmware's
-# "self." prefix stripped — the request_permission handler strips it before lookup.
-# Markers below bound the literal so /admin/safety can edit deterministically.
-# === ADMIN_ALLOWLIST_START ===
-MCP_TOOL_ALLOWLIST: set[str] = {
-    "get_device_status",
-    "audio_speaker.set_volume",
-    "screen.set_brightness",
-    "screen.set_theme",
-    "robot.get_head_angles",
-    "robot.set_head_angles",
-    "robot.set_led_color",
-    "robot.create_reminder",
-    "robot.get_reminders",
-    "robot.stop_reminder",
-}
-# === ADMIN_ALLOWLIST_END ===
-# MCP_TOOL_DENYLIST, VOICE_TURN_SUFFIX, VOICE_TURN_SUFFIX_SHORT are set by
-# `_apply_kid_mode` at module init and on each toggle. FALLBACK_EMOJI /
-# ALLOWED_EMOJIS / _BASE_SUFFIX / _KID_MODE_SUFFIX are imported from
-# custom-providers/textUtils.py (single canonical home).
-VOICE_CHANNELS = ("dotty", "stackchan")
-VOICE_TURN_PREFIX = "[channel=dotty voice-TTS]\n"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("zeroclaw-bridge")
-
-app_lock = asyncio.Lock()
-
-# Fire-and-forget asyncio task pin. asyncio holds Tasks via weakref
-# only — `asyncio.create_task(coro)` without retaining the returned
-# Task may have it GC'd before it runs. Pin to this module-level set
-# and auto-discard on completion.
-_BACKGROUND_TASKS: set[asyncio.Task] = set()
-
-
-def _spawn(coro, *, name: str | None = None) -> asyncio.Task:
-    """Spawn an asyncio task that won't be GC'd while it's running.
-
-    Use anywhere you'd write `asyncio.create_task(coro)` and don't
-    need the returned Task locally — fire-and-forget dispatches.
-    Tasks awaited / stored elsewhere don't need this wrapper.
-    """
-    t = asyncio.create_task(coro, name=name)
-    _BACKGROUND_TASKS.add(t)
-    t.add_done_callback(_BACKGROUND_TASKS.discard)
-    return t
-
-# ---------------------------------------------------------------------------
-# Context injection — date/time, weather, calendar
-# ---------------------------------------------------------------------------
-
-class Event(TypedDict):
-    """One calendar event, post-parsing.
-
-    `person` is either the tag captured from a `[Name] ...` summary prefix
-    or `CALENDAR_HOUSEHOLD_BUCKET` when no tag matched. `time` is a short,
-    human-friendly local-time string suitable for prompt injection
-    (e.g. "09:30" or "all-day"); `start_iso` is the raw ISO timestamp
-    retained ONLY for the cache + admin debug endpoint and MUST be
-    stripped by `summarize_for_prompt` before any prompt or LAN response.
-    """
-    person: str
-    time: str
-    summary: str
-    start_iso: str
-    calendar_id: str
-
-
-_weather_cache: dict = {"text": "", "fetched": 0.0}
-# `events`: structured list[Event] sorted by start_iso. `by_person`:
-# bucketed view for cheap per-person lookup (keys include the
-# CALENDAR_HOUSEHOLD_BUCKET sentinel). `consecutive_failures`: drives
-# the polling loop's exponential backoff; reset to 0 on a successful
-# fetch. `date` is the local-day stamp the cache was last filled for —
-# when it doesn't match today, the cache is flushed (events + by_person)
-# rather than just having the date string updated, fixing a bug where
-# stale events stuck around past midnight until the next successful
-# fetch landed.
-_calendar_cache: dict = {
-    "events": [],          # list[Event]
-    "by_person": {},       # dict[str, list[Event]]
-    "fetched": 0.0,
-    "date": "",
-    "consecutive_failures": 0,
-}
-
-# Email-address regex used by the privacy funnel. Conservative: matches
-# RFC-style local@domain.tld with at least one dot in the domain part.
-_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")
-# ISO-8601 timestamp regex (date or datetime, with optional offset/Z).
-# Catches both `2025-04-25` (all-day) and `2025-04-25T09:30:00+10:00`.
-_ISO_TS_RE = re.compile(
-    r"\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b"
-)
-
-
-def _format_event_time(start_iso: str) -> str:
-    """Render `start_iso` as a short local clock string for prompts.
-
-    Returns "all-day" for date-only stamps, "HH:MM" for datetime stamps,
-    or "" if parsing fails (callers should treat that as `summarize_for_prompt`'s
-    fallback path)."""
-    if not start_iso:
-        return ""
-    # All-day events come back as plain `YYYY-MM-DD` from the gws CLI.
-    if "T" not in start_iso:
-        return "all-day"
-    try:
-        dt = datetime.fromisoformat(start_iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=LOCAL_TZ)
-        return dt.astimezone(LOCAL_TZ).strftime("%H:%M")
-    except ValueError:
-        return ""
-
-
-async def _fetch_weather() -> str:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "curl", "-s", "-m", "10",
-            f"wttr.in/{WEATHER_LOCATION}?format=%C+%t+%h+%w",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-        text = stdout.decode("utf-8").strip()
-        if text and "Unknown" not in text and "Sorry" not in text:
-            return text
-    except Exception:
-        log.warning("weather fetch failed", exc_info=True)
-    return ""
-
-
-async def _fetch_calendar_events() -> list[Event]:
-    """Fetch today's events across all configured calendars.
-
-    Raises on full failure (every configured calendar errored) so the
-    polling loop can apply backoff. Per-calendar failures only log; an
-    empty list is still a valid success (e.g. nothing scheduled today).
-    """
-    if not CALENDAR_IDS or not os.path.isfile(CALENDAR_SA_PATH):
-        return []
-    now = datetime.now(LOCAL_TZ)
-    time_min = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    time_max = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
-    env = {**os.environ, "GOOGLE_APPLICATION_CREDENTIALS": CALENDAR_SA_PATH}
-    all_events: list[Event] = []
-    failures = 0
-    for cal_id in CALENDAR_IDS:
-        try:
-            params = json.dumps({
-                "calendarId": cal_id,
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": True,
-                "orderBy": "startTime",
-                "maxResults": 10,
-            })
-            proc = await asyncio.create_subprocess_exec(
-                GWS_BIN, "calendar", "events", "list", "--params", params,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=env,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-            data = json.loads(stdout.decode("utf-8"))
-            for item in data.get("items", []):
-                raw_summary = item.get("summary", "")
-                start_obj = item.get("start", {})
-                start_iso = start_obj.get("dateTime", start_obj.get("date", ""))
-                if not raw_summary:
-                    continue
-                m = _CALENDAR_PERSON_RE.match(raw_summary)
-                if m:
-                    person = m.group("person")
-                    rest = m.group("rest").strip()
-                else:
-                    person = CALENDAR_HOUSEHOLD_BUCKET
-                    rest = raw_summary.strip()
-                all_events.append(Event(
-                    person=person,
-                    time=_format_event_time(start_iso),
-                    summary=rest,
-                    start_iso=start_iso,
-                    calendar_id=cal_id,
-                ))
-        except asyncio.TimeoutError:
-            failures += 1
-            if _METRICS_AVAILABLE:
-                _safe_metric(dotty_calendar_fetch_failures_total.labels(kind="timeout").inc)
-            log.warning("calendar fetch timed out cal=%s", cal_id, exc_info=True)
-        except (json.JSONDecodeError, ValueError):
-            failures += 1
-            if _METRICS_AVAILABLE:
-                _safe_metric(dotty_calendar_fetch_failures_total.labels(kind="parse").inc)
-            log.warning("calendar fetch parse failed cal=%s", cal_id, exc_info=True)
-        except Exception:
-            failures += 1
-            if _METRICS_AVAILABLE:
-                _safe_metric(dotty_calendar_fetch_failures_total.labels(kind="other").inc)
-            log.warning("calendar fetch failed cal=%s", cal_id, exc_info=True)
-    if CALENDAR_IDS and failures == len(CALENDAR_IDS):
-        # Every calendar failed — propagate so the polling loop can back off.
-        raise RuntimeError("all calendar fetches failed")
-    all_events.sort(key=lambda e: e["start_iso"])
-    return all_events
-
-
-def _bucket_by_person(events: list[Event]) -> dict[str, list[Event]]:
-    out: dict[str, list[Event]] = {}
-    for ev in events:
-        out.setdefault(ev["person"], []).append(ev)
-    return out
-
-
-def summarize_for_prompt(
-    events: list[Event],
-    *,
-    person: str | None = None,
-    include_household: bool = True,
-) -> list[str]:
-    """**Single privacy chokepoint** for calendar -> prompt injection.
-
-    Strips ISO timestamps, email addresses, and calendar IDs; emits only
-    short `HH:MM summary` (or `all-day summary`) strings. All call sites
-    that put calendar data into a model prompt MUST go through here —
-    this is the only place enforcing the privacy contract.
-
-    `person`: if set, return only that person's events (plus household
-    when `include_household` is true). If None, return events for every
-    person.
-    """
-    out: list[str] = []
-    for ev in events:
-        if person is not None:
-            if ev["person"] != person and not (
-                include_household and ev["person"] == CALENDAR_HOUSEHOLD_BUCKET
-            ):
-                continue
-        time_label = ev["time"] or ""
-        # Defence-in-depth: scrub anything that looks like a leaked
-        # timestamp or email even if it somehow ended up in a summary
-        # field. The fetch path already strips raw timestamps, but the
-        # summary text comes from the user, so an event titled
-        # "Call alice@x.com 2025-04-25T09:00" would leak otherwise.
-        clean_summary = _ISO_TS_RE.sub("", ev["summary"])
-        clean_summary = _EMAIL_RE.sub("[email]", clean_summary)
-        clean_summary = " ".join(clean_summary.split())  # collapse whitespace
-        if not clean_summary:
-            continue
-        if ev["person"] != CALENDAR_HOUSEHOLD_BUCKET and person is None:
-            tag = f"[{ev['person']}] "
-        else:
-            tag = ""
-        if time_label:
-            out.append(f"{time_label} {tag}{clean_summary}".strip())
-        else:
-            out.append(f"{tag}{clean_summary}".strip())
-    return out
-
-
-async def _refresh_caches() -> None:
-    now = perf_counter()
-    if now - _weather_cache["fetched"] > WEATHER_TTL_SEC:
-        text = await _fetch_weather()
-        if text:
-            _weather_cache["text"] = text
-        _weather_cache["fetched"] = now
-
-    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-    if not CALENDAR_IDS:
-        return
-    date_rolled = _calendar_cache["date"] != today
-    ttl_expired = now - _calendar_cache["fetched"] > CALENDAR_TTL_SEC
-    if date_rolled:
-        # Nightly-flush fix: previously only the `date` string was being
-        # updated when the day rolled over, which meant yesterday's
-        # events stuck in the cache (and therefore in every prompt and
-        # the /api/calendar/today response) until the next *successful*
-        # fetch landed. Drop them eagerly so even a failed refresh on
-        # day-roll yields an empty cache rather than yesterday's data.
-        _calendar_cache["events"] = []
-        _calendar_cache["by_person"] = {}
-        _calendar_cache["date"] = today
-    if date_rolled or ttl_expired:
-        try:
-            events = await _fetch_calendar_events()
-            _calendar_cache["events"] = events
-            _calendar_cache["by_person"] = _bucket_by_person(events)
-            _calendar_cache["fetched"] = now
-            _calendar_cache["date"] = today
-            _calendar_cache["consecutive_failures"] = 0
-        except Exception:
-            # Don't update `fetched` so the next request retries; bump
-            # failure counter so the polling loop can back off.
-            #
-            # Per-calendar exceptions are already counted with finer-grained
-            # `kind` labels inside `_fetch_calendar_events`. This outer arm
-            # only fires when the orchestrator itself raises — typically the
-            # `RuntimeError("all calendar fetches failed")` propagation, or
-            # an unexpected setup-time error (subprocess spawn, env). Tag
-            # `kind="orchestrator"` so it's distinguishable from the
-            # categorized per-calendar failures and doesn't double-count.
-            _calendar_cache["consecutive_failures"] += 1
-            if _METRICS_AVAILABLE:
-                _safe_metric(dotty_calendar_fetch_failures_total.labels(kind="orchestrator").inc)
-            log.warning("calendar refresh failed (consecutive=%d)",
-                        _calendar_cache["consecutive_failures"], exc_info=True)
-
-
-# Exponential-backoff schedule (seconds) when consecutive_failures > 0.
-# After this is exhausted we sit at the last value (10 min) until a
-# success resets the counter.
-_CALENDAR_BACKOFF_SCHEDULE_SEC = (60.0, 120.0, 300.0, 600.0)
-
-
-async def _calendar_poll_loop() -> None:
-    """Background task: periodically refresh the calendar cache so the
-    next conversation turn always sees fresh-ish data without paying a
-    fetch latency on the request path. Uses exponential backoff after a
-    fetch fails so a flaky service-account or upstream Google outage
-    doesn't get hammered."""
-    if not CALENDAR_IDS:
-        return
-    while True:
-        try:
-            failures = int(_calendar_cache.get("consecutive_failures", 0))
-            if failures == 0:
-                delay = CALENDAR_POLL_SEC
-            else:
-                idx = min(failures - 1, len(_CALENDAR_BACKOFF_SCHEDULE_SEC) - 1)
-                delay = _CALENDAR_BACKOFF_SCHEDULE_SEC[idx]
-            await asyncio.sleep(delay)
-            await _refresh_caches()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # Belt-and-braces: never let an unexpected error kill the
-            # poll loop. _refresh_caches already handles its own errors,
-            # but a bug elsewhere shouldn't take the cache offline.
-            log.exception("calendar poll loop iteration crashed")
-            await asyncio.sleep(CALENDAR_POLL_SEC)
-
-
-def _build_context() -> str:
-    parts = []
-    now = datetime.now(LOCAL_TZ)
-    parts.append(now.strftime("%A %d %B %Y, %H:%M %Z"))
-    if _weather_cache["text"]:
-        parts.append(f"{WEATHER_LOCATION}: {_weather_cache['text']}")
-    events = _calendar_cache.get("events") or []
-    if events:
-        # Privacy funnel — never inline raw event records into a prompt.
-        cleaned = summarize_for_prompt(events)
-        if cleaned:
-            parts.append("Today: " + "; ".join(cleaned))
-    return f"[Context: {' | '.join(parts)}]\n"
-
-
-def _build_perception_block(device_id: str | None) -> str:
-    """Render the latest perception snapshot for `device_id` as a
-    `[Current perception]` line for the talk-turn system prompt.
-
-    Re-evaluated on every turn so multi-turn conversations see fresh
-    perception. Returns "" when nothing meaningful is cached so cold
-    idle turns don't waste tokens on an empty marker.
-    """
-    if not device_id:
-        return ""
-    try:
-        from bridge.perception import snapshot as _perception_snapshot
-        snap = _perception_snapshot(
-            device_id,
-            perception_state=_perception_state,
-            vision_cache=_vision_cache,
-            audio_cache=_audio_cache,
-            scene_synthesis_cache=_scene_synthesis_cache,
-        )
-        return snap.to_prompt_block()
-    except Exception:
-        # A perception read failure must never break the voice path.
-        log.exception("perception block build failed; voice turn proceeding without it")
-        return ""
-
-
-def _wrap_voice(text: str, turn: int, device_id: str | None = None) -> str:
-    suffix = VOICE_TURN_SUFFIX if turn == 0 else VOICE_TURN_SUFFIX_SHORT
-    return (
-        VOICE_TURN_PREFIX
-        + _build_perception_block(device_id)
-        + _build_context()
-        + text
-        + suffix
-    )
-
-
-def _wrap_voice_with_block(
-    text: str, turn: int, speaker_block: str, device_id: str | None = None,
-) -> str:
-    """Variant of `_wrap_voice` that injects a pre-built multi-line
-    speaker block (e.g. `[Speaking with] Hudson — 7yo, loves Lego.`)
-    instead of the single-line `[Speaker: name]` marker. Used by the
-    SpeakerResolver path. Block order: `[channel] [speaker] [perception]
-    [context] {user}` — speaker first (who) then perception (what's
-    happening) then time/weather context."""
-    suffix = VOICE_TURN_SUFFIX if turn == 0 else VOICE_TURN_SUFFIX_SHORT
-    return (
-        VOICE_TURN_PREFIX
-        + speaker_block
-        + _build_perception_block(device_id)
-        + _build_context()
-        + text
-        + suffix
-    )
-
-
-def _build_speaker_block(resolution) -> str:
-    """Render a `SpeakerResolution` as a single-line `[Speaking with]`
-    block for the LLM prompt. Returns "" when no person resolved.
-
-    Token budget is small by design (~50 tokens): one line, compact
-    person description, signal trail. Birthdate and other PII are
-    *never* inlined — `compact_description()` enforces that contract.
-    """
-    if resolution is None or not resolution.addressee:
-        return ""
-    if resolution.person_id is None:
-        # Resolver fell through to fallback (`_household` etc.) — no
-        # specific identity to pin. Better to skip the block than to
-        # mislead the model with a generic addressee.
-        return ""
-    line = f"[Speaking with] {resolution.addressee}"
-    if _household_registry is not None:
-        try:
-            person = _household_registry.get(resolution.person_id)
-            if person is not None:
-                line = f"[Speaking with] {person.compact_description(max_chars=180)}"
-        except Exception:
-            log.debug(
-                "speaker block: registry.get raised; using addressee only",
-                exc_info=True,
-            )
-    if resolution.votes:
-        sigs = ",".join(v.signal for v in resolution.votes)
-        line = f"{line}  (signals: {sigs}, conf={resolution.confidence:.2f})"
-    return line + "\n"
-
-
-def _resolve_speaker_for_request(payload):
-    """Resolve who's speaking for the current request. Returns a
-    `SpeakerResolution` or None when the resolver is unavailable. Errors
-    are logged and swallowed so a resolver hiccup never breaks the
-    voice path.
-
-    `metadata.room_match_person_id` is shuttled through to the resolver
-    when present — the room_view roster identification path emits it on
-    the second line of the [ROOM_VIEW] marker; see the zeroclaw
-    provider's `_payload`."""
-    if _speaker_resolver is None:
-        return None
-    try:
-        meta = payload.metadata or {}
-        return _speaker_resolver.resolve(
-            payload.content or "",
-            channel=payload.channel,
-            device_id=meta.get("device_id"),
-            vlm_match_person_id=meta.get("room_match_person_id"),
-        )
-    except Exception:
-        log.exception(
-            "speaker: resolve() raised — voice turn proceeding without enrichment",
-        )
-        return None
-
-
-def _voice_preparer(channel: str | None, resolution=None,
-                    room_description: str | None = None,
-                    device_id: str | None = None,
-                    person_memory_block: str | None = None):
-    """Build a `prepare` callback for `acp.prompt`.
-
-    Four layers of speaker context, additive (any combination may be
-    present per turn):
-
-      * **Resolver path** — a `SpeakerResolution` with a registry
-        `person_id` rolls up self-ID / sticky / calendar / time-of-day
-        into a `[Speaking with] Hudson — 7yo, loves Lego.` block. See
-        `bridge/speaker.py`.
-      * **Room view (description-based, no storage)** — a one-line
-        natural-language description of who is currently in front of
-        the camera (`[Room view] a child with curly brown hair in a
-        striped t-shirt`). Captured by the VLM on `face_detected`,
-        cleared on `face_lost`. Ephemeral; never persists. Useful when
-        the resolver has no `person_id` (visitor / not-yet-self-ID'd)
-        AND when it does (LLM gets both a name and a fresh visual
-        anchor). See `xiaozhi-server` perception relay for the capture
-        side.
-      * **Legacy face-rec path** — when neither of the above produces
-        anything, consume any pending face-recognized identity marker
-        for this channel and emit the historic `[Speaker: name]` line.
-      * **Person memory** — durable per-person facts from the
-        `person:<id>` namespace of `brain.db`, pre-rendered by the
-        caller and passed in as `person_memory_block`. Injected after
-        `[Speaking with]` and before `[Current perception]`. See #53.
-
-    `device_id` is curried into the wrapper so `_build_perception_block`
-    can read the latest perception caches at every turn (multi-turn
-    sessions see fresh perception, not the snapshot at preparer build).
-    """
-    if channel not in VOICE_CHANNELS:
-        return None
-    block_parts: list[str] = []
-    if resolution is not None:
-        speaker_block = _build_speaker_block(resolution)
-        if speaker_block:
-            block_parts.append(speaker_block)
-    if person_memory_block:
-        block_parts.append(person_memory_block)
-    if room_description:
-        cleaned = room_description.strip()
-        # Defensive: cap length so a runaway VLM response can't blow
-        # the prompt budget. 240 is enough for one rich sentence; the
-        # capture-side prompt asks for "one short sentence" already.
-        if len(cleaned) > 240:
-            cleaned = cleaned[:237].rstrip() + "..."
-        block_parts.append(f"[Room view] {cleaned}\n")
-    if block_parts:
-        return functools.partial(
-            _wrap_voice_with_block,
-            speaker_block="".join(block_parts),
-            device_id=device_id,
-        )
-    return functools.partial(_wrap_voice, device_id=device_id)
-
-
-class MessageIn(BaseModel):
-    content: str
-    channel: str | None = None
-    session_id: str | None = None
-    metadata: dict | None = None
-
-
-class MessageOut(BaseModel):
-    response: str
-    session_id: str
-
-
-class _SessionInvalid(Exception):
-    pass
-
-
-class ACPClient:
-    """Long-running `zeroclaw acp` child, JSON-RPC 2.0 over stdio.
-
-    Caches one ACP sessionId across bridge requests to avoid per-turn
-    workspace reload on the ZeroClaw side. Rotates the session on idle
-    timeout, turn count, or wall-clock age; invalidates on session-not-found
-    errors and on ACP child respawn. Serialized via asyncio.Lock because
-    ACP stdio is a single channel and voice traffic is single-speaker.
-    """
-
-    def __init__(self) -> None:
-        self._proc: asyncio.subprocess.Process | None = None
-        self._id_gen = itertools.count(1)
-        self._sid: str | None = None
-        self._sid_last_used: float = 0.0
-        self._sid_created: float = 0.0
-        self._sid_turns: int = 0
-        self._in_flight_rid: int | None = None
-        # Per-call latency phases from the most recent prompt(). Keys:
-        # total_ms, new_ms, prompt_ms, stop_ms, reused (1/0). Read by
-        # log_turn callers so the convo NDJSON carries a phase breakdown
-        # for dashboard surfacing. Overwritten on every prompt() entry.
-        self._last_phases: dict[str, float] = {}
-        # Lifetime is bound to _proc — cleaned up in _cancel_stderr_task()
-        # from every spawn-replacement path so respawns can't leak readers.
-        self._stderr_task: asyncio.Task[None] | None = None
-
-    async def _drain_stderr(self, proc: asyncio.subprocess.Process) -> None:
-        # Without this, the daemon's exit reason is invisible — that was
-        # the diagnostic blind spot behind the 2026-04-28 session/new
-        # crash. Rate-cap protects us if the child ever loops on stderr.
-        if proc.stderr is None:
-            return
-        pid = proc.pid
-        loop = asyncio.get_event_loop()
-        bucket_start = loop.time()
-        bucket_count = 0
-        DROP_THRESHOLD = 200
-        try:
-            while True:
-                raw = await proc.stderr.readline()
-                if not raw:
-                    return
-                now = loop.time()
-                if now - bucket_start >= 1.0:
-                    dropped = bucket_count - DROP_THRESHOLD
-                    if dropped > 0:
-                        log.warning(
-                            "zeroclaw-stderr pid=%s: dropped %d lines (rate cap)",
-                            pid, dropped,
-                        )
-                    bucket_start = now
-                    bucket_count = 0
-                bucket_count += 1
-                if bucket_count > DROP_THRESHOLD:
-                    continue
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    log.warning("zeroclaw-stderr pid=%s: %s", pid, line)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.debug("stderr drain raised", exc_info=True)
-
-    async def _cancel_stderr_task(self) -> None:
-        task = self._stderr_task
-        self._stderr_task = None
-        if task is None or task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    async def _spawn(self) -> None:
-        # Any respawn path invalidates the cached session — ZeroClaw has no memory of it.
-        self._sid = None
-        self._sid_turns = 0
-        await self._cancel_stderr_task()
-        env = {**os.environ, "RUST_LOG": "error"}
-        self._proc = await asyncio.create_subprocess_exec(
-            ZEROCLAW_BIN, "acp",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc))
-        rid = next(self._id_gen)
-        await self._send({"jsonrpc": "2.0", "id": rid, "method": "initialize", "params": {}})
-        resp = await self._recv_matching(rid, INIT_TIMEOUT_SEC)
-        caps = resp.get("result", {}).get("capabilities", {})
-        log.info("ACP initialized pid=%s capabilities=%s", self._proc.pid, caps)
-
-    async def ensure_alive(self) -> None:
-        if self._proc is None or self._proc.returncode is not None:
-            if self._proc is not None:
-                log.warning("ACP child exited rc=%s; respawning", self._proc.returncode)
-            await self._spawn()
-
-    async def _send(self, obj: dict) -> None:
-        assert self._proc and self._proc.stdin
-        self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-        await self._proc.stdin.drain()
-
-    async def _recv_matching(
-        self,
-        rid: int,
-        timeout: float,
-        on_event: Callable[[dict], Awaitable[None]] | None = None,
-    ) -> dict:
-        assert self._proc and self._proc.stdout
-        loop = asyncio.get_event_loop()
-        end = loop.time() + timeout
-        while True:
-            remaining = end - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            raw = await asyncio.wait_for(self._proc.stdout.readline(), timeout=remaining)
-            if not raw:
-                raise RuntimeError("ACP child closed stdout")
-            try:
-                obj = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
-                log.warning("ACP non-JSON line ignored: %r", raw[:200])
-                continue
-            if obj.get("id") == rid and "method" not in obj:
-                return obj
-            method = obj.get("method")
-            if method == "session/event":
-                params = obj.get("params") or {}
-                evt_type = params.get("type")
-                if evt_type == "tool_call":
-                    log.info("tool-call name=%s", params.get("name", "?"))
-                elif evt_type == "tool_result":
-                    log.info("tool-result name=%s len=%d",
-                             params.get("name", "?"),
-                             len(str(params.get("output", ""))))
-                if on_event is not None:
-                    try:
-                        await on_event(params)
-                    except Exception:
-                        log.exception("session/event callback raised")
-                continue
-            if method == "session/request_permission":
-                perm_id = obj.get("id")
-                tool_name = (obj.get("params") or {}).get("toolName", "")
-                # Normalise: firmware sends "self.camera.take_photo" etc.
-                bare_name = tool_name.removeprefix("self.")
-                if bare_name in MCP_TOOL_DENYLIST:
-                    log.warning(
-                        "tool-permission DENIED tool=%s (denylist, kid_mode=%s)",
-                        tool_name, KID_MODE,
-                    )
-                    await self._send({
-                        "jsonrpc": "2.0", "id": perm_id,
-                        "result": {"approved": False},
-                    })
-                elif bare_name in MCP_TOOL_ALLOWLIST:
-                    log.info("tool-permission tool=%s approved=True", tool_name)
-                    await self._send({
-                        "jsonrpc": "2.0", "id": perm_id,
-                        "result": {"approved": True},
-                    })
-                else:
-                    # Unknown tool — permissive default, but log for visibility.
-                    log.info(
-                        "tool-permission tool=%s approved=True (unlisted)",
-                        tool_name,
-                    )
-                    await self._send({
-                        "jsonrpc": "2.0", "id": perm_id,
-                        "result": {"approved": True},
-                    })
-                continue
-            if method:
-                log.debug("ACP notification method=%s", method)
-                continue
-
-    async def _new_session(self) -> None:
-        rid = next(self._id_gen)
-        await self._send({"jsonrpc": "2.0", "id": rid, "method": "session/new", "params": {}})
-        resp = await self._recv_matching(rid, INIT_TIMEOUT_SEC)
-        if "error" in resp:
-            raise RuntimeError(f"session/new: {resp['error']}")
-        now = asyncio.get_event_loop().time()
-        self._sid = resp["result"]["sessionId"]
-        self._sid_created = now
-        self._sid_last_used = now
-        self._sid_turns = 0
-        if _METRICS_AVAILABLE:
-            # Single ACP child = at most one session, but a Gauge tolerates
-            # the abstraction — we set rather than inc so respawns don't
-            # double-count if a close was missed.
-            _safe_metric(dotty_active_acp_sessions.set, 1)
-
-    async def _close_session(self, sid: str) -> None:
-        try:
-            rid = next(self._id_gen)
-            await self._send({
-                "jsonrpc": "2.0", "id": rid, "method": "session/stop",
-                "params": {"sessionId": sid},
-            })
-            try:
-                await self._recv_matching(rid, STOP_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                log.debug("session/stop ack timed out (non-fatal)")
-        except Exception:
-            log.debug("session/stop best-effort close raised; ignoring", exc_info=True)
-        finally:
-            if _METRICS_AVAILABLE:
-                _safe_metric(dotty_active_acp_sessions.set, 0)
-
-    async def _cancel_prompt(self) -> None:
-        """Cancel the in-flight ACP turn after barge-in.
-
-        Never SIGTERMs the daemon — that path raced the freshly-spawned
-        successor's session/new (probably sqlite WAL contention with the
-        just-killed predecessor) and produced the 2026-04-28
-        'ACP child closed stdout' crash, reproducible at <12ms by parallel
-        cancelled streams on one xiaozhi session. Stale session/event
-        messages for the cancelled session are filtered by request-id
-        mismatch in _recv_matching.
-        """
-        sid = self._sid
-        self._in_flight_rid = None
-        self._sid = None
-        self._sid_turns = 0
-        if _METRICS_AVAILABLE:
-            _safe_metric(dotty_active_acp_sessions.set, 0)
-
-        # Already-dead daemon: clean up handles, next prompt will respawn.
-        if self._proc is not None and self._proc.returncode is not None:
-            await self._cancel_stderr_task()
-            self._proc = None
-            return
-
-        # Active session: ask the daemon to drop it cleanly. Daemon stays alive.
-        if sid is not None and self._proc is not None:
-            await self._close_session(sid)
-            return
-
-        # Cancelled before a session was created — leave the daemon alone.
-        # An in-flight session/new (if any) will land in the pipe and be
-        # filtered by id mismatch on the next _recv_matching.
-        return
-
-    def _should_rotate(self, now: float) -> tuple[bool, str | None]:
-        if self._sid is None:
-            return (False, None)
-        if now - self._sid_last_used > SESSION_IDLE_TIMEOUT_SEC:
-            return (True, "idle")
-        if self._sid_turns >= SESSION_MAX_TURNS:
-            return (True, "turns")
-        if now - self._sid_created > SESSION_MAX_AGE_SEC:
-            return (True, "age")
-        return (False, None)
-
-    @staticmethod
-    def _is_session_invalid_error(err: dict) -> bool:
-        msg = str(err.get("message", "")).lower()
-        if "session" in msg and any(
-            marker in msg for marker in ("not found", "invalid", "expired", "unknown")
-        ):
-            return True
-        return False
-
-    async def _do_prompt(
-        self,
-        text: str,
-        chunk_cb: Callable[[str], Awaitable[None]] | None = None,
-    ) -> str:
-        rid = next(self._id_gen)
-        self._in_flight_rid = rid
-        await self._send({
-            "jsonrpc": "2.0", "id": rid, "method": "session/prompt",
-            "params": {"sessionId": self._sid, "prompt": text},
-        })
-
-        on_event = None
-        if chunk_cb is not None:
-            async def on_event(params: dict) -> None:
-                if params.get("type") != "chunk":
-                    return
-                content = params.get("content") or ""
-                if content:
-                    await chunk_cb(content)
-
-        resp = await self._recv_matching(rid, REQUEST_TIMEOUT_SEC, on_event=on_event)
-        if "error" in resp:
-            err = resp["error"]
-            if self._is_session_invalid_error(err):
-                raise _SessionInvalid(str(err))
-            raise RuntimeError(f"session/prompt: {err}")
-        return resp.get("result", {}).get("content", "") or ""
-
-    async def prompt(
-        self,
-        text: str,
-        xiaozhi_sid: str | None = None,
-        chunk_cb: Callable[[str], Awaitable[None]] | None = None,
-        prepare: Callable[[str, int], str] | None = None,
-    ) -> str:
-        async with app_lock:
-            await self.ensure_alive()
-            loop = asyncio.get_event_loop()
-            now = loop.time()
-
-            rotate, reason = self._should_rotate(now)
-            if rotate and self._sid is not None:
-                old = self._sid
-                self._sid = None
-                await self._close_session(old)
-                log.info("session-rotated reason=%s old_sid=%s turns=%d",
-                         reason, old[:8], self._sid_turns)
-
-            t_total = perf_counter()
-            new_ms = 0.0
-            prompt_ms = 0.0
-            stop_ms = 0.0  # always 0 in the reuse path; kept in log for continuity
-            phase = "new"
-            self._last_phases = {}
-            try:
-                if self._sid is None:
-                    t_new = perf_counter()
-                    await self._new_session()
-                    new_ms = (perf_counter() - t_new) * 1000.0
-                reused = 0 if new_ms > 0.0 else 1
-                effective_text = prepare(text, self._sid_turns) if prepare is not None else text
-
-                phase = "prompt"
-                t_prompt = perf_counter()
-                try:
-                    content = await self._do_prompt(effective_text, chunk_cb=chunk_cb)
-                except _SessionInvalid as si:
-                    log.info("session-invalidated reason=%s", str(si)[:120])
-                    self._sid = None
-                    t_new = perf_counter()
-                    await self._new_session()
-                    new_ms += (perf_counter() - t_new) * 1000.0
-                    reused = 0
-                    effective_text = prepare(text, self._sid_turns) if prepare is not None else text
-                    content = await self._do_prompt(effective_text, chunk_cb=chunk_cb)
-                prompt_ms = (perf_counter() - t_prompt) * 1000.0
-
-                self._sid_last_used = loop.time()
-                self._sid_turns += 1
-
-                total_ms = (perf_counter() - t_total) * 1000.0
-                self._last_phases = {
-                    "total_ms": round(total_ms),
-                    "new_ms": round(new_ms),
-                    "prompt_ms": round(prompt_ms),
-                    "stop_ms": round(stop_ms),
-                    "reused": float(reused),
-                }
-                log.info(
-                    "latency_ms total=%.0f new=%.0f prompt=%.0f stop=%.0f "
-                    "sid=%s reused=%d turn=%d xiaozhi_sid=%s",
-                    total_ms, new_ms, prompt_ms, stop_ms,
-                    (self._sid or "none")[:8], reused, self._sid_turns,
-                    (xiaozhi_sid or "none")[:8],
-                )
-                return content
-            except asyncio.CancelledError:
-                total_ms = (perf_counter() - t_total) * 1000.0
-                log.info(
-                    "prompt-cancelled (barge-in) latency_ms=%.0f sid=%s turn=%d",
-                    total_ms, (self._sid or "none")[:8], self._sid_turns,
-                )
-                try:
-                    await self._cancel_prompt()
-                except Exception:
-                    log.debug("cancel cleanup failed", exc_info=True)
-                raise
-            except (BrokenPipeError, ConnectionResetError, RuntimeError, asyncio.TimeoutError):
-                total_ms = (perf_counter() - t_total) * 1000.0
-                log.exception(
-                    "ACP call failed phase=%s latency_ms total=%.0f new=%.0f prompt=%.0f",
-                    phase, total_ms, new_ms, prompt_ms,
-                )
-                if self._proc is not None:
-                    try:
-                        self._proc.kill()
-                    except ProcessLookupError:
-                        pass
-                    self._proc = None
-                await self._cancel_stderr_task()
-                self._sid = None
-                raise
-
-    async def shutdown(self) -> None:
-        if self._proc is not None and self._proc.returncode is None:
-            if self._sid is not None:
-                await self._close_session(self._sid)
-                self._sid = None
-            try:
-                self._proc.terminate()
-                await asyncio.wait_for(self._proc.wait(), timeout=2.0)
-            except (ProcessLookupError, asyncio.TimeoutError):
-                try:
-                    self._proc.kill()
-                except ProcessLookupError:
-                    pass
-        await self._cancel_stderr_task()
-        if _METRICS_AVAILABLE:
-            _safe_metric(dotty_active_acp_sessions.set, 0)
-
-
-acp = ACPClient()
-
-
-class _ConvoLogger:
-    """Writes one NDJSON record per conversation turn to a daily log file."""
-
-    def __init__(self, log_dir: Path) -> None:
-        self._dir = log_dir
-        try:
-            self._dir.mkdir(parents=True, exist_ok=True)
-            self._dir.chmod(0o700)
-        except OSError:
-            log.warning("convo log dir creation failed: %s", self._dir)
-
-    def log_turn(
-        self,
-        *,
-        channel: str,
-        session_id: str,
-        request_text: str,
-        response_text: str,
-        latency_ms: float,
-        error: str | None = None,
-        latency_phases: dict[str, float] | None = None,
-        type: str = "chat",
-    ) -> None:
-        now = datetime.now(LOCAL_TZ)
-        emoji_used = ""
-        stripped = response_text.lstrip()
-        for e in ALLOWED_EMOJIS:
-            if stripped.startswith(e):
-                emoji_used = e
-                break
-        record = {
-            "ts": now.isoformat(),
-            "type": type,
-            "channel": channel or "",
-            "session_id": session_id,
-            "request_text": request_text,
-            "response_len": len(response_text),
-            "response_text": response_text,
-            "emoji_used": emoji_used,
-            "latency_ms": round(latency_ms),
-            "error": error,
-        }
-        if latency_phases:
-            record["latency_phases"] = latency_phases
-        path = self._dir / f"convo-{now.strftime('%Y-%m-%d')}.ndjson"
-        try:
-            with open(path, "a") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            path.chmod(0o600)
-        except Exception:
-            log.warning("convo log write failed", exc_info=True)
-        _dashboard_broadcast_turn(
-            channel=channel or "",
-            request_text=request_text,
-            response_text=response_text,
-            latency_ms=latency_ms,
-            error=error,
-            emoji_used=emoji_used,
-            ts_iso=now.isoformat(),
-            latency_phases=latency_phases,
-        )
-
-
-_convo_log = _ConvoLogger(CONVO_LOG_DIR)
-
-
-# --- Portal event broadcast (P12, P13) -----------------------------------
-# In-process pub/sub for completed turns. Subscribers get an asyncio.Queue
-# they can drain; the bridge pushes to all queues after each log_turn.
-_dashboard_event_listeners: list[asyncio.Queue] = []
-
-
-def _dashboard_subscribe_events() -> asyncio.Queue:
-    q: asyncio.Queue = asyncio.Queue(maxsize=100)
-    _dashboard_event_listeners.append(q)
-    return q
-
-
-def _dashboard_unsubscribe_events(q: asyncio.Queue) -> None:
-    try:
-        _dashboard_event_listeners.remove(q)
-    except ValueError:
-        pass
-
-
-def _dashboard_broadcast_turn(*, channel: str, request_text: str,
-                           response_text: str, latency_ms: float,
-                           error: str | None, emoji_used: str,
-                           ts_iso: str,
-                           latency_phases: dict[str, float] | None = None) -> None:
-    if not _dashboard_event_listeners:
-        return
-    event = {
-        "ts": ts_iso,
-        "channel": channel,
-        "request_text": request_text,
-        "response_text": response_text,
-        "latency_ms": round(latency_ms),
-        "error": error,
-        "emoji_used": emoji_used,
-    }
-    if latency_phases:
-        event["latency_phases"] = latency_phases
-    for q in list(_dashboard_event_listeners):
-        try:
-            q.put_nowait(event)
-        except asyncio.QueueFull:
-            pass
-
-
-# --- Perception event bus (Phase 1) --------------------------------------
-# In-process pub/sub for ambient perception events emitted by firmware
-# producers (face_detected, face_lost, sound_event, ...) via the
-# xiaozhi-server event relay, and later by server-side classifiers
-# (audio scene, vision). Mirrors the _dashboard_event_listeners pattern.
-# Phase 1 has no consumers wired yet — landed standalone so producers
-# and tests can validate the surface before consumers are added.
-_perception_listeners: list[asyncio.Queue] = []
-_perception_state: dict[str, dict] = {}
-_PERCEPTION_STALE_THRESHOLD_S: float = 30.0  # idle > 30 s → stale
-
-# In-memory ring of the most recent perception events per device, used by the
-# dashboard's "Scene context" panel to show what Dotty has lately seen / heard.
-# Bounded so a chatty firmware can't grow the bridge's RSS unbounded; one
-# deque per device, dropped LRU-style when a new device first appears would
-# require an active eviction policy — for a single-device deployment this is
-# effectively a global ring. Text-only: matches the user constraint that no
-# raw media bytes get persisted (these events carry only labels + scalars).
-_PERCEPTION_RECENT_MAX: int = 20
-_perception_recent_events: dict[str, "collections.deque[dict]"] = {}
-
-# #69 — rolling sound-localizer `balance` samples for the dashboard State
-# tile sparkline. sound_event fires ~1 Hz while there's sound; 90 samples
-# comfortably spans the 60 s window the sparkline renders.
-_SOUND_BALANCE_WINDOW_SEC: float = 60.0
-_sound_balance_history: "collections.deque[tuple[float, float]]" = (
-    collections.deque(maxlen=90)
-)
-
-
-def _sound_balance_series() -> list[float]:
-    """Sound-localizer `balance` samples from the last
-    `_SOUND_BALANCE_WINDOW_SEC`, oldest→newest — the dashboard sparkline
-    source (#69). Empty when no sound_event has landed recently."""
-    cutoff = time.time() - _SOUND_BALANCE_WINDOW_SEC
-    return [bal for ts, bal in _sound_balance_history if ts >= cutoff]
-
-
-# #74 — vision-capture failures for the dashboard aggregator. (ts, kind)
-# tuples; the getter windows to the last hour and counts by error kind.
-_vision_failures: "collections.deque[tuple[float, str]]" = collections.deque(
-    maxlen=200
-)
-
-
-def _vision_failure_record(kind: str) -> None:
-    """Record a vision-capture failure for the dashboard aggregator (#74)."""
-    _vision_failures.append((time.time(), str(kind or "unknown")))
-
-
-def _vision_failures_last_hour() -> dict[str, int]:
-    """Vision-capture failures in the last hour, counted by error kind."""
-    cutoff = time.time() - 3600.0
-    counts: dict[str, int] = {}
-    for ts, kind in _vision_failures:
-        if ts >= cutoff:
-            counts[kind] = counts.get(kind, 0) + 1
-    return counts
-
-
-def _perception_subscribe() -> asyncio.Queue:
-    q: asyncio.Queue = asyncio.Queue(maxsize=200)
-    _perception_listeners.append(q)
-    return q
-
-
-def _perception_unsubscribe(q: asyncio.Queue) -> None:
-    try:
-        _perception_listeners.remove(q)
-    except ValueError:
-        pass
-
-
-def _perception_recent_append(event: dict) -> None:
-    """Push the event onto the per-device ring buffer (bounded). Mirrors the
-    structure security_watch.RECENT_CYCLES uses but for raw perception events
-    rather than security cycles. Called from the central broadcast hook so
-    every event sees the same fan-out."""
-    device_id = event.get("device_id") or ""
-    if not device_id or device_id == "unknown":
-        return
-    ring = _perception_recent_events.get(device_id)
-    if ring is None:
-        ring = collections.deque(maxlen=_PERCEPTION_RECENT_MAX)
-        _perception_recent_events[device_id] = ring
-    ring.append({
-        "ts": event.get("ts"),
-        "name": event.get("name"),
-        "data": event.get("data") or {},
-    })
-
-
-def get_recent_perception(device_id: str, limit: int | None = None) -> list[dict]:
-    """Return the most-recent perception events for ``device_id`` (newest first)."""
-    ring = _perception_recent_events.get(device_id)
-    if not ring:
-        return []
-    items = list(ring)
-    items.reverse()
-    if limit is not None:
-        items = items[:limit]
-    return items
-
-
-def _perception_broadcast(event: dict) -> None:
-    # Bounded label cardinality: only count names we know about so a
-    # buggy or malicious payload can't blow up the time-series count.
-    name = event.get("name") or ""
-    if _METRICS_AVAILABLE and name in (
-        "face_detected", "face_lost", "sound_event", "state_changed",
-        "face_identified_applied", "face_identified_rejected",
-    ):
-        _safe_metric(
-            dotty_perception_events_total.labels(type=name).inc,
-        )
-    # Recent-events ring — text-only, in-memory, bounded. Hooks the
-    # dashboard's "Scene context" panel without altering the producer
-    # contract or persisting anything to disk.
-    _perception_recent_append(event)
-    if not _perception_listeners:
-        return
-    for q in list(_perception_listeners):
-        try:
-            q.put_nowait(event)
-        except asyncio.QueueFull:
-            log.warning(
-                "perception queue full, dropping event: %s",
-                event.get("name"),
-            )
-
-
-def _update_perception_state(device_id: str, name: str,
-                             data: dict, ts: float) -> None:
-    """Mutate per-device state. Convenience fields read by the
-    engagement gate (Phase 4) and Phase 1 consumers."""
-    state = _perception_state.setdefault(device_id, {})
-    state["last_event_t"] = ts
-    state["last_event_name"] = name
-    if name == "face_detected":
-        state["face_present"] = True
-        state["last_face_t"] = ts
-    elif name == "face_lost":
-        state["face_present"] = False
-        state["last_face_lost_t"] = ts
-        # NOTE: don't pop last_face_id / face_mood here. The HuMan detector
-        # flickers (face_detected/face_lost pairs every ~1 s while a person
-        # stands in frame). Popping on every face_lost made the dashboard
-        # chip and the firmware green pip collapse to "detected" within
-        # one second of identification. Freshness is enforced at read time
-        # via FACE_IDENTITY_TTL_SEC against last_face_recognized_t.
-    elif name == "sound_event":
-        state["last_sound_dir"] = data.get("direction")
-        state["last_sound_t"] = ts
-        state["last_sound_energy"] = data.get("energy")
-        bal = data.get("balance")
-        if isinstance(bal, (int, float)):
-            _sound_balance_history.append((time.time(), float(bal)))
-    elif name == "state_changed":
-        # Phase 4 — track the firmware's high-level State so consumers can gate
-        # behaviour on it (e.g. greeter skips during security; ambient awareness
-        # only runs in idle). Set by StateManager::emitStateChanged on every
-        # transition.
-        new_state = (data.get("state") or "").strip().lower()
-        if new_state:
-            state["current_state"] = new_state
-            state["last_state_change_t"] = ts
-            # Keep dance_active in sync with current_state as a fallback —
-            # dance_started/ended events are the primary signal, but if one
-            # is dropped we still won't get stuck with the flag inverted.
-            if new_state == "dance":
-                state["dance_active"] = True
-            elif state.get("dance_active"):
-                state["dance_active"] = False
-    elif name == "dance_started":
-        state["dance_active"] = True
-        state["last_dance_started_t"] = ts
-    elif name == "dance_ended":
-        state["dance_active"] = False
-        state["last_dance_ended_t"] = ts
-    elif name == "chat_status":
-        # Edge-only emission from firmware (stackchan_display.cc) on
-        # LISTENING <-> not-LISTENING transitions. Drives the dashboard's
-        # listening LED mirror.
-        listening = bool(data.get("listening"))
-        state["listening"] = listening
-        state["last_chat_status_t"] = ts
-    elif name == "face_recognized":
-        # Synthetic event broadcast by /api/vision/explain when the room-view
-        # VLM matches a household roster member. Track the identity so the
-        # dashboard can paint the face pixel green vs yellow.
-        identity = (data.get("identity") or "").strip()
-        if identity:
-            state["last_face_id"] = identity
-            state["last_face_recognized_t"] = ts
-
-
-def _is_dance_active(device_id: str) -> bool:
-    """True iff the device is currently in DANCE state. Used to gate
-    autonomous photos and TTS so they don't interrupt a dance."""
-    return bool(_perception_state.get(device_id, {}).get("dance_active"))
-
-
-def _current_device_state(device_id: str) -> str:
-    """Convenience accessor — returns the last known firmware State for a
-    device, or 'idle' if no state_changed event has been seen yet (default
-    on boot before StateManager fires its first transition). Consumers that
-    need to gate on state should call this."""
-    return _perception_state.get(device_id, {}).get("current_state", "idle")
 
 
 async def _dispatch_abort(device_id: str) -> None:
-    """Phase 1.2 follow-up: send xiaozhi admin abort to stop in-flight
-    TTS for a device. Reused by the face-lost aborter so Dotty stops
-    talking when its audience walks away mid-response."""
+    """Send xiaozhi admin abort to stop in-flight TTS for a device."""
     if not _XIAOZHI_HOST:
         return
     url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/abort"
@@ -1906,186 +200,19 @@ async def _dispatch_abort(device_id: str) -> None:
         try:
             r = requests.post(url, json=payload, timeout=3)
             if r.status_code >= 400:
-                log.warning(
-                    "face-lost abort %s: %s", r.status_code, r.text[:200])
+                log.warning("abort %s: %s", r.status_code, r.text[:200])
         except Exception as exc:
-            log.warning("face-lost abort failed: %s", exc)
-
-    await asyncio.to_thread(_post)
-
-
-async def _perception_face_lost_aborter() -> None:
-    """On face_lost, if a greeting recently fired and the user hasn't
-    walked back into frame within the grace period, fire xiaozhi admin
-    abort so Dotty stops talking to empty space.
-
-    Two-stage filter:
-      1. Only acts within FACE_LOST_ABORT_WINDOW_SEC of the last greet
-         (long-finished conversations are left alone).
-      2. Schedules the abort FACE_LOST_ABORT_GRACE_SEC in the future
-         and cancels it if face_detected fires for the same device
-         before then. This protects greet/listen cycles from being
-         killed by a transient face_lost (head turn, blink, brief
-         occlusion) — the firmware face tracker is sensitive enough
-         that without this, the aborter ate every turn empirically.
-    """
-    log.info(
-        "perception face-lost aborter started (window=%.0fs grace=%.1fs)",
-        FACE_LOST_ABORT_WINDOW_SEC, FACE_LOST_ABORT_GRACE_SEC,
-    )
-    pending: dict[str, asyncio.Task] = {}
-
-    async def _delayed_abort(device_id: str, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-            log.info(
-                "face_lost → abort: device=%s (face stayed lost %.1fs)",
-                device_id, delay,
-            )
-            await _dispatch_abort(device_id)
-        except asyncio.CancelledError:
-            log.info(
-                "face_lost abort cancelled (face returned): device=%s",
-                device_id,
-            )
-            raise
-
-    q = _perception_subscribe()
-    try:
-        while True:
-            event = await q.get()
-            name = event.get("name")
-            device_id = event.get("device_id", "")
-            if not device_id or device_id == "unknown":
-                continue
-
-            if name == "face_detected":
-                t = pending.pop(device_id, None)
-                if t and not t.done():
-                    t.cancel()
-                continue
-
-            if name != "face_lost":
-                continue
-
-            now = event.get("ts", 0.0)
-            state = _perception_state.setdefault(device_id, {})
-            last_greet = state.get("last_face_greet_t", 0.0)
-            if now - last_greet > FACE_LOST_ABORT_WINDOW_SEC:
-                continue
-
-            prior = pending.pop(device_id, None)
-            if prior and not prior.done():
-                prior.cancel()
-            log.info(
-                "face_lost → schedule abort in %.1fs: device=%s (greet %.1fs ago)",
-                FACE_LOST_ABORT_GRACE_SEC, device_id, now - last_greet,
-            )
-            pending[device_id] = asyncio.create_task(
-                _delayed_abort(device_id, FACE_LOST_ABORT_GRACE_SEC),
-            )
-    except asyncio.CancelledError:
-        log.info("perception face-lost aborter cancelled")
-        for t in pending.values():
-            if not t.done():
-                t.cancel()
-        raise
-    except Exception:
-        log.exception("perception face-lost aborter crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-async def _dispatch_face_greeting(device_id: str, text: str) -> None:
-    """Phase 1.5 helper: fire-and-forget POST to the xiaozhi admin
-    inject-text route, same path the dashboard greeter uses."""
-    if not _XIAOZHI_HOST:
-        log.warning("face greeter: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
-        return
-    if _is_dance_active(device_id):
-        log.info("face greeter: suppressed (dance active): device=%s", device_id)
-        return
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/inject-text"
-    payload = {"text": text, "device_id": device_id}
-
-    def _post() -> None:
-        try:
-            r = requests.post(url, json=payload, timeout=3)
-            if r.status_code >= 400:
-                log.warning(
-                    "face greeter inject-text %s: %s",
-                    r.status_code, r.text[:200],
-                )
-        except Exception as exc:
-            log.warning("face greeter inject-text failed: %s", exc)
-
-    await asyncio.to_thread(_post)
-
-
-async def _dispatch_say(device_id: str, text: str) -> None:
-    """Layer 6 helper: fire-and-forget POST to the xiaozhi admin /say
-    route, which streams TTS opus packets straight to the device WS
-    bypassing the ASR/LLM pipeline. Used by ProactiveGreeter so a
-    server-generated greeting plays as Dotty's speech rather than
-    being treated as a fake user utterance (which is what
-    /admin/inject-text → startToChat does)."""
-    if not _XIAOZHI_HOST:
-        log.warning("greeter say: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
-        return
-    if _is_dance_active(device_id):
-        log.info("greeter say: suppressed (dance active): device=%s", device_id)
-        return
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/say"
-    payload = {"text": text, "device_id": device_id}
-
-    def _post() -> None:
-        try:
-            r = requests.post(url, json=payload, timeout=3)
-            if r.status_code >= 400:
-                log.warning(
-                    "greeter say %s: %s",
-                    r.status_code, r.text[:200],
-                )
-        except Exception as exc:
-            log.warning("greeter say failed: %s", exc)
-
-    await asyncio.to_thread(_post)
-
-
-async def _dispatch_set_head_angles(device_id: str, yaw: int,
-                                     pitch: int, speed: int) -> None:
-    """Phase 1.6 helper: fire-and-forget POST to the new
-    /xiaozhi/admin/set-head-angles route to send a direct MCP
-    head-angles frame to the device."""
-    if not _XIAOZHI_HOST:
-        log.warning("sound turn: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
-        return
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/set-head-angles"
-    payload = {
-        "device_id": device_id, "yaw": yaw, "pitch": pitch, "speed": speed,
-    }
-
-    def _post() -> None:
-        try:
-            r = requests.post(url, json=payload, timeout=3)
-            if r.status_code >= 400:
-                log.warning(
-                    "sound turn set-head-angles %s: %s",
-                    r.status_code, r.text[:200],
-                )
-        except Exception as exc:
-            log.warning("sound turn set-head-angles failed: %s", exc)
+            log.warning("abort failed: %s", exc)
 
     await asyncio.to_thread(_post)
 
 
 async def _dispatch_set_state(device_id: str, state: str) -> bool:
-    """Phase 4 helper: fire MCP self.robot.set_state at the firmware via the
-    /xiaozhi/admin/set-state route. State must be one of:
-    idle / talk / story_time / security / sleep / dance.
-    Returns True on 2xx, False otherwise (and logs)."""
+    """Fire MCP self.robot.set_state via /xiaozhi/admin/set-state.
+    Valid state: idle / talk / story_time / security / sleep / dance.
+    Returns True on 2xx."""
     if not _XIAOZHI_HOST:
-        log.warning("set_state: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
+        log.warning("set_state: XIAOZHI_HOST not set")
         return False
     url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/set-state"
     payload = {"device_id": device_id, "state": state}
@@ -2104,27 +231,24 @@ async def _dispatch_set_state(device_id: str, state: str) -> bool:
     return await asyncio.to_thread(_post)
 
 
-async def _dispatch_set_face_identified(device_id: str) -> bool:
-    """Fire MCP self.robot.set_face_identified at the firmware via the
-    /xiaozhi/admin/set-face-identified route. Lights the right-ring face
-    pixel green for ~4 seconds (firmware-side timeout). Failures are
-    non-fatal — name-greeting still played, the missing LED is cosmetic.
-    """
+async def _dispatch_set_toggle(device_id: str, name: str, enabled: bool) -> bool:
+    """Fire MCP self.robot.set_toggle via /xiaozhi/admin/set-toggle.
+    Toggle name must be one of: kid_mode / smart_mode."""
     if not _XIAOZHI_HOST:
-        log.warning("set_face_identified: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
+        log.warning("set_toggle: XIAOZHI_HOST not set")
         return False
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/set-face-identified"
-    payload = {"device_id": device_id}
+    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/set-toggle"
+    payload = {"device_id": device_id, "name": name, "enabled": enabled}
 
     def _post() -> bool:
         try:
             r = requests.post(url, json=payload, timeout=3)
             if r.status_code >= 400:
-                log.warning("set_face_identified %s: %s", r.status_code, r.text[:200])
+                log.warning("set_toggle %s: %s", r.status_code, r.text[:200])
                 return False
             return True
         except Exception as exc:
-            log.warning("set_face_identified failed: %s", exc)
+            log.warning("set_toggle failed: %s", exc)
             return False
 
     return await asyncio.to_thread(_post)
@@ -2134,10 +258,7 @@ async def _dispatch_set_tier1slim_model(
     model: str, url: str = "", api_key: str = "",
 ) -> bool:
     """Hot-swap the running Tier1Slim provider's model (and optionally url /
-    api_key) via the xiaozhi-server admin endpoint. Used by smart_mode flip
-    when DOTTY_VOICE_PROVIDER=tier1slim — replaces the legacy
-    _apply_model_swap path which rewrites the ZeroClaw voice daemon's
-    config.toml (irrelevant when voice runs through xiaozhi/Tier1Slim).
+    api_key) via the xiaozhi-server admin endpoint. Used by smart_mode flip.
     Returns True on 2xx."""
     if not _XIAOZHI_HOST:
         log.warning("set_tier1slim_model: XIAOZHI_HOST not set")
@@ -2165,1903 +286,48 @@ async def _dispatch_set_tier1slim_model(
     return await asyncio.to_thread(_post)
 
 
-async def _dispatch_set_toggle(device_id: str, name: str, enabled: bool) -> bool:
-    """Phase 4 helper: fire MCP self.robot.set_toggle at the firmware via the
-    /xiaozhi/admin/set-toggle route. Toggle name must be one of:
-    kid_mode / smart_mode. Returns True on 2xx, False otherwise (and logs)."""
-    if not _XIAOZHI_HOST:
-        log.warning("set_toggle: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
-        return False
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/set-toggle"
-    payload = {"device_id": device_id, "name": name, "enabled": enabled}
-
-    def _post() -> bool:
-        try:
-            r = requests.post(url, json=payload, timeout=3)
-            if r.status_code >= 400:
-                log.warning("set_toggle %s: %s", r.status_code, r.text[:200])
-                return False
-            return True
-        except Exception as exc:
-            log.warning("set_toggle failed: %s", exc)
-            return False
-
-    return await asyncio.to_thread(_post)
-
-
-async def _perception_sound_turner() -> None:
-    """Phase 1.6 consumer: on sound_event, turn the head toward the
-    sound direction (left / centre / right) via direct MCP. Idle-only
-    behaviour — face wins, conversation wins.
-    """
-    log.info(
-        "perception sound turner started (cooldown=%.0fs yaw=±%d speed=%d)",
-        SOUND_TURN_COOLDOWN_SEC, SOUND_TURN_YAW_DEG, SOUND_TURN_SPEED,
-    )
-    q = _perception_subscribe()
-    try:
-        while True:
-            event = await q.get()
-            if event.get("name") != "sound_event":
-                continue
-            device_id = event.get("device_id", "")
-            if not device_id or device_id == "unknown":
-                continue
-            direction = (event.get("data") or {}).get("direction", "")
-            if direction not in ("left", "centre", "center", "right"):
-                continue
-
-            now = event.get("ts", 0.0)
-            state = _perception_state.setdefault(device_id, {})
-            # Idle-only: face wins, conversation wins.
-            if state.get("face_present"):
-                continue
-            last_chat = state.get("last_chat_t", 0.0)
-            if now - last_chat < 30.0:
-                continue
-            last_turn = state.get("last_sound_turn_t", 0.0)
-            if now - last_turn < SOUND_TURN_COOLDOWN_SEC:
-                continue
-            state["last_sound_turn_t"] = now
-
-            if direction == "left":
-                yaw = -SOUND_TURN_YAW_DEG
-            elif direction == "right":
-                yaw = SOUND_TURN_YAW_DEG
-            else:
-                yaw = 0
-            log.info(
-                "sound_event → head-turn: device=%s direction=%s yaw=%d",
-                device_id, direction, yaw,
-            )
-            _spawn(
-                _dispatch_set_head_angles(
-                    device_id, yaw, 0, SOUND_TURN_SPEED,
-                ),
-                name="dispatch_set_head_angles",
-            )
-            head_turn_data = {
-                "yaw": yaw, "pitch": 0, "speed": SOUND_TURN_SPEED,
-                "reason": "sound_localizer", "direction": direction,
-                "energy": (event.get("data") or {}).get("energy"),
-            }
-            _update_perception_state(device_id, "head_turn", head_turn_data, now)
-            _perception_broadcast({
-                "device_id": device_id, "ts": now,
-                "name": "head_turn", "data": head_turn_data,
-            })
-    except asyncio.CancelledError:
-        log.info("perception sound turner cancelled")
-        raise
-    except Exception:
-        log.exception("perception sound turner crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-async def _perception_wake_word_turner() -> None:
-    """On wake_word_detected, turn the head toward the speaker.
-
-    Distinct intent from _perception_sound_turner above:
-      - sound_turner   = "curious about an ambient noise" (cooldown'd, gentler)
-      - wake_word_turn = "look at the user who summoned me" (deliberate, no cooldown, faster)
-
-    Skips when a face is already being tracked — face_tracking owns the
-    gaze in that case and we don't want to override it. Skips on
-    direction=centre because there's no spatial info to act on.
-
-    Updates state["last_sound_turn_t"] so the ambient sound turner above
-    doesn't immediately re-fire on the user's continued voice.
-    """
-    if not WAKE_TURN_ENABLED:
-        log.info("perception wake-word turner disabled by env")
-        return
-    log.info(
-        "perception wake-word turner started (yaw=±%d speed=%d)",
-        WAKE_TURN_YAW_DEG, WAKE_TURN_SPEED,
-    )
-    q = _perception_subscribe()
-    try:
-        while True:
-            event = await q.get()
-            if event.get("name") != "wake_word_detected":
-                continue
-            device_id = event.get("device_id", "")
-            if not device_id or device_id == "unknown":
-                continue
-            data = event.get("data") or {}
-            direction = data.get("direction", "")
-            if direction not in ("left", "right"):  # skip centre / unknown
-                continue
-
-            state = _perception_state.setdefault(device_id, {})
-            if state.get("face_present"):
-                # Face tracker is already pointing the head at someone;
-                # don't yank it elsewhere on a wake from a different
-                # direction. (Likely the speaker IS the tracked face.)
-                continue
-
-            yaw = -WAKE_TURN_YAW_DEG if direction == "left" else WAKE_TURN_YAW_DEG
-            now = event.get("ts", 0.0)
-            # Suppress the ambient sound turner from immediately re-firing
-            # on the user's continued voice after the wake word.
-            state["last_sound_turn_t"] = now
-
-            log.info(
-                "wake_word_detected → head-turn: device=%s phrase=%r dir=%s yaw=%d",
-                device_id, data.get("phrase", ""), direction, yaw,
-            )
-            _spawn(
-                _dispatch_set_head_angles(
-                    device_id, yaw, 0, WAKE_TURN_SPEED,
-                ),
-                name="dispatch_set_head_angles_wake",
-            )
-            head_turn_data = {
-                "yaw": yaw, "pitch": 0, "speed": WAKE_TURN_SPEED,
-                "reason": "wake_word", "direction": direction,
-                "phrase": data.get("phrase", ""),
-            }
-            _update_perception_state(device_id, "head_turn", head_turn_data, now)
-            _perception_broadcast({
-                "device_id": device_id, "ts": now,
-                "name": "head_turn", "data": head_turn_data,
-            })
-    except asyncio.CancelledError:
-        log.info("perception wake-word turner cancelled")
-        raise
-    except Exception:
-        log.exception("perception wake-word turner crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-async def _handle_face_recognized(event: dict) -> None:
-    """Named-recognition acknowledger: on `face_recognized`, look up
-    the identity in the household registry and speak `"Oh, it's
-    <display_name>!"` so the user gets explicit proof of recognition.
-
-    Independent of the bare-greet `face_detected` path and the rich
-    ProactiveGreeter — those still fire on their own cadence. Uses
-    `_dispatch_say` (TTS, bypasses ASR/LLM) so it plays as Dotty's
-    own speech rather than a fake user utterance.
-    """
-    device_id = event.get("device_id", "")
-    if not device_id or device_id == "unknown":
-        return
-    data = event.get("data") or {}
-    identity = data.get("identity") or ""
-    if not identity:
-        return
-    if _household_registry is None:
-        return
-    person = _household_registry.get(identity)
-    if person is None or not person.display_name:
-        log.debug("face_recognized: identity=%s not in roster", identity)
-        return
-    now = event.get("ts", 0.0)
-    state = _perception_state.setdefault(device_id, {})
-    last_chat = state.get("last_chat_t", 0.0)
-    if now - last_chat < FACE_NAME_GREET_QUIET_AFTER_CHAT_SEC:
-        log.debug(
-            "face_recognized → suppressed (chat fresh): device=%s identity=%s",
-            device_id, identity,
-        )
-        return
-    name_greets = state.setdefault("last_name_greet_t", {})
-    last_named = name_greets.get(identity, 0.0)
-    if now - last_named < FACE_NAME_GREET_MIN_INTERVAL_SEC:
-        return
-    name_greets[identity] = now
-    text = FACE_NAME_GREET_TEMPLATE.format(name=person.display_name)
-    log.info(
-        "face_recognized → name-greet: device=%s identity=%s text=%r",
-        device_id, identity, text,
-    )
-    _spawn(
-        _dispatch_say(device_id, text),
-        name="dispatch_name_greet",
-    )
-    # Light the right-ring face pixel green to mirror the named greeting.
-    # Firmware auto-times-out after ~4 s; bridge can refresh by calling again
-    # if the same face stays in frame across multiple recognitions.
-    _spawn(
-        _dispatch_set_face_identified(device_id),
-        name="dispatch_set_face_identified",
-    )
-
-
-async def _perception_face_greeter() -> None:
-    """Phase 1.5 consumer: on face_detected events, fire a brief
-    audible greeting through the existing inject-text path so the
-    user knows the robot saw them. Cooldown'd per device.
-
-    The plan called for a 5 s manual-listen window. The xiaozhi
-    protocol's `listen` frames are device→server only, so a true
-    server-driven mic-open requires a firmware change (tracked as
-    a Phase 1.2 follow-up). Greeting the user is the same spirit
-    on the existing surface and is the natural seed for Phase 4
-    curiosity / boredom mode behaviour.
-    """
-    log.info(
-        "perception face greeter started (min_interval=%.0fs text=%r)",
-        FACE_GREET_MIN_INTERVAL_SEC, FACE_GREET_TEXT,
-    )
-    log.info(
-        "perception named acknowledger active (min_interval=%.0fs template=%r quiet_after_chat=%.0fs)",
-        FACE_NAME_GREET_MIN_INTERVAL_SEC, FACE_NAME_GREET_TEMPLATE,
-        FACE_NAME_GREET_QUIET_AFTER_CHAT_SEC,
-    )
-    q = _perception_subscribe()
-    try:
-        while True:
-            event = await q.get()
-            ev_name = event.get("name")
-            if ev_name == "face_recognized":
-                await _handle_face_recognized(event)
-                continue
-            if ev_name != "face_detected":
-                continue
-            device_id = event.get("device_id", "")
-            if not device_id or device_id == "unknown":
-                continue
-            # Time-of-day gate. Sensor-noise frames in low light can trip
-            # the face detector; greeting an empty room at 3 am is the
-            # highest-value thing to suppress. Default window 06–21
-            # (LOCAL_TZ); see FACE_GREET_HOUR_START / _END env vars.
-            current_hour = datetime.now(LOCAL_TZ).hour
-            if not (FACE_GREET_HOUR_START <= current_hour < FACE_GREET_HOUR_END):
-                log.debug(
-                    "face_detected → suppressed (outside %d-%d window): device=%s",
-                    FACE_GREET_HOUR_START, FACE_GREET_HOUR_END, device_id,
-                )
-                continue
-            # Layer 6 hand-off: if the household has a roster (anyone
-            # with an `appearance:` field), the room-view roster match
-            # path will fire its own contextual greeting via
-            # ProactiveGreeter within ~1-2 s. Suppress the bare "Hi!"
-            # to avoid stacking it on top of "Hey Hudson, library day!".
-            # Empty roster (no household.yaml or no appearances) → keep
-            # the bare "Hi!" alive so unconfigured deployments still
-            # acknowledge faces.
-            if _household_registry is not None and \
-                    _household_registry.roster_ids_with_appearance():
-                log.debug(
-                    "face_detected → suppressed (roster owns greeting): "
-                    "device=%s", device_id,
-                )
-                continue
-            now = event.get("ts", 0.0)
-            state = _perception_state.setdefault(device_id, {})
-            last_greet = state.get("last_face_greet_t", 0.0)
-            if now - last_greet < FACE_GREET_MIN_INTERVAL_SEC:
-                continue
-            state["last_face_greet_t"] = now
-            # Empty FACE_GREET_TEXT disables the verbal injection — the
-            # firmware-side WakeWordInvoke("face") still fires, so the
-            # device opens its mic without the bridge saying "Hi!". This
-            # gives "popup chime + mic open" rather than "popup chime +
-            # 'Hi!' + mic open", which can feel quieter day-to-day.
-            if not FACE_GREET_TEXT:
-                log.info(
-                    "face_detected → mic-only (FACE_GREET_TEXT empty): device=%s",
-                    device_id,
-                )
-                continue
-            log.info("face_detected → greeting: device=%s", device_id)
-            _spawn(
-                _dispatch_face_greeting(device_id, FACE_GREET_TEXT),
-                name="dispatch_face_greeting",
-            )
-    except asyncio.CancelledError:
-        log.info("perception face greeter cancelled")
-        raise
-    except Exception:
-        log.exception("perception face greeter crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-def get_fresh_face_id(device_id: str, now: float | None = None) -> str | None:
-    """TTL-aware accessor for `last_face_id`. Returns the cached identity if
-    it was confirmed within FACE_IDENTITY_TTL_SEC, else None.
-
-    Single source of truth for "is this person still identified?" across
-    the dashboard chip, talk-turn perception snapshot, and the LED refresh
-    loop. Replaces the previous "pop on face_lost" approach which collapsed
-    identity within ~1 s of detector flicker.
-    """
-    state = _perception_state.get(device_id) or {}
-    identity = (state.get("last_face_id") or "").strip()
-    if not identity or identity == "unknown":
-        return None
-    last_t = state.get("last_face_recognized_t") or 0.0
-    if not last_t:
-        return None
-    wall_now = now if now is not None else time.time()
-    if (wall_now - last_t) > FACE_IDENTITY_TTL_SEC:
-        return None
-    return identity
-
-
-async def _perception_face_identified_refresher() -> None:
-    """Periodically re-fire `set_face_identified` MCP while a person stays
-    in frame. Firmware self-times-out the green pip after ~4 s; without a
-    refresh the LED would only be green for the first 4 s of every 2-min
-    VLM-cooldown window. This loop runs at FACE_IDENTITY_REFRESH_INTERVAL_SEC
-    and skips devices whose identity is stale (TTL-expired) or whose face
-    has been genuinely lost for >FACE_IDENTITY_REFRESH_QUIET_SEC.
-    """
-    log.info(
-        "perception face-identified refresher started "
-        "(interval=%.1fs ttl=%.0fs quiet_after_lost=%.1fs)",
-        FACE_IDENTITY_REFRESH_INTERVAL_SEC,
-        FACE_IDENTITY_TTL_SEC,
-        FACE_IDENTITY_REFRESH_QUIET_SEC,
-    )
-    try:
-        while True:
-            await asyncio.sleep(FACE_IDENTITY_REFRESH_INTERVAL_SEC)
-            wall_now = time.time()
-            for device_id, state in list(_perception_state.items()):
-                if not isinstance(state, dict):
-                    continue
-                identity = get_fresh_face_id(device_id, wall_now)
-                if not identity:
-                    continue
-                # If face has been lost for longer than the quiet window,
-                # skip — we don't want to light the pip for an empty room
-                # even if the TTL hasn't expired yet.
-                face_present = bool(state.get("face_present"))
-                last_lost = state.get("last_face_lost_t") or 0.0
-                if not face_present and last_lost:
-                    if (wall_now - last_lost) > FACE_IDENTITY_REFRESH_QUIET_SEC:
-                        continue
-                log.info(
-                    "face_identified_refresh: device=%s identity=%s",
-                    device_id, identity,
-                )
-                _spawn(
-                    _dispatch_set_face_identified(device_id),
-                    name="dispatch_set_face_identified_refresh",
-                )
-    except asyncio.CancelledError:
-        log.info("perception face-identified refresher cancelled")
-        raise
-    except Exception:
-        log.exception("perception face-identified refresher crashed")
-
-
 # ---------------------------------------------------------------------------
-# Purr-on-head-pet (Option B: server-pushed pre-rendered asset)
+# MCP tool permission policy — edited by /admin/safety
 # ---------------------------------------------------------------------------
-
-async def _dispatch_purr_audio(device_id: str) -> bool:
-    """Push the purr asset to the device.
-
-    Mirrors the inject-text dispatcher pattern used by the face greeter
-    but targets a play-asset admin route on xiaozhi-server. The matching
-    server-side admin route is a follow-up — until it lands, this call
-    will log a warning and return False, but it MUST NOT crash the
-    perception loop.
-
-    Defensive contract:
-      * Missing XIAOZHI_HOST → return False (no network attempt).
-      * Network/HTTP failure → return False, log warning. Asset existence
-        is checked server-side by xiaozhi-server's /play-asset route,
-        which returns 404 if the path doesn't resolve in its own
-        filesystem — the bridge surfaces that as a play-asset warning.
-    """
-    if not _XIAOZHI_HOST:
-        log.warning("purr: XIAOZHI_HOST not set; cannot reach xiaozhi-server")
-        return False
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/play-asset"
-    payload = {"device_id": device_id, "asset": str(PURR_AUDIO_PATH)}
-
-    def _post() -> bool:
-        try:
-            r = requests.post(url, json=payload, timeout=3)
-            if r.status_code >= 400:
-                log.warning(
-                    "purr play-asset %s: %s",
-                    r.status_code, r.text[:200],
-                )
-                return False
-            return True
-        except Exception as exc:
-            log.warning("purr play-asset failed: %s", exc)
-            return False
-
-    try:
-        return await asyncio.to_thread(_post)
-    except Exception:
-        log.exception("purr dispatch raised")
-        return False
-
-
-async def _perception_purr_player() -> None:
-    """Consumer: on `head_pet_started` events, push the purr asset.
-
-    Per-device cooldown stops a continuous head-pet from re-triggering
-    the clip on every event burst. Bypasses kid-mode sandwich (the
-    asset is curated bytes, not LLM-generated content). Extends
-    `last_chat_t` by `PURR_DURATION_SEC` so the sound localizer
-    (`_perception_sound_turner`) doesn't turn the head toward the
-    speaker mid-purr — without that suppression the localizer would
-    treat the purr's own audio as a sound event from the side.
-
-    Firmware-side `head_pet_started` perception event emission is a
-    separate task (see firmware/firmware/main/stackchan/modifiers/
-    head_pet.h:82-91 for the existing visual-only handler). This
-    consumer is ready for whenever that event lands on the bus.
-    """
-    log.info(
-        "perception purr player started (cooldown=%.0fs asset=%s)",
-        PURR_COOLDOWN_SEC, PURR_AUDIO_PATH,
-    )
-    q = _perception_subscribe()
-    try:
-        while True:
-            event = await q.get()
-            if event.get("name") != "head_pet_started":
-                continue
-            device_id = event.get("device_id", "")
-            if not device_id or device_id == "unknown":
-                continue
-            now = event.get("ts", 0.0)
-            state = _perception_state.setdefault(device_id, {})
-            last_purr = state.get("last_purr_t", 0.0)
-            if now - last_purr < PURR_COOLDOWN_SEC:
-                continue
-            state["last_purr_t"] = now
-            # Suppress the sound-localiser head-turn while the purr
-            # plays. Setting last_chat_t to now+duration is the
-            # single hook the localiser already reads (it skips
-            # turns when last_chat_t is fresh).
-            state["last_chat_t"] = now + PURR_DURATION_SEC
-            log.info("head_pet_started → purr: device=%s", device_id)
-            _spawn(_dispatch_purr_audio(device_id), name="dispatch_purr_audio")
-    except asyncio.CancelledError:
-        log.info("perception purr player cancelled")
-        raise
-    except Exception:
-        log.exception("perception purr player crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-# ---------------------------------------------------------------------------
-# Fixed-audio asset allowlist
-# ---------------------------------------------------------------------------
-# Pre-rendered audio that bypasses the kid-mode content-filter sandwich
-# because the bytes are curated, not LLM-generated. Add new assets here
-# when you wire them into a perception consumer or admin route — keeps
-# the "what plays without filtering" surface visible in one place.
-_FIXED_AUDIO_ASSETS: tuple[Path, ...] = (PURR_AUDIO_PATH,)
-
-
-# ---------------------------------------------------------------------------
-# ProactiveGreeter (Layer 6) — adapters
-# ---------------------------------------------------------------------------
-# The greeter expects an object that exposes ``subscribe()`` ->
-# ``asyncio.Queue`` and ``unsubscribe(q)``. Our perception bus is a pair
-# of free functions (`_perception_subscribe` / `_perception_unsubscribe`)
-# operating on a module-level listener list; the adapter below is the
-# minimum shim needed to bridge the two shapes without altering the
-# in-process bus surface that other consumers already rely on.
-class _PerceptionBusAdapter:
-    """Wraps the free-function perception bus to match the greeter's
-    duck-typed dependency-injection contract."""
-
-    @staticmethod
-    def subscribe() -> asyncio.Queue:
-        return _perception_subscribe()
-
-    @staticmethod
-    def unsubscribe(q: asyncio.Queue) -> None:
-        _perception_unsubscribe(q)
-
-
-class _CalendarFacade:
-    """Wraps `_calendar_cache` + `summarize_for_prompt` into the
-    `get_events()` / `summarize_for_prompt(events, person, include_household)`
-    shape the greeter wants. Reads the cache lazily so a midnight roll or
-    a fresh poll lands without a greeter restart. All branches are
-    defensive — any raise here would propagate into the greeter's
-    handler and be try/except-swallowed there, but we still degrade
-    gracefully so the LLM-prompt path stays valid."""
-
-    @staticmethod
-    def get_events() -> list:
-        try:
-            return list(_calendar_cache.get("events") or [])
-        except Exception:
-            log.debug(
-                "greeter calendar facade: get_events() raised", exc_info=True,
-            )
-            return []
-
-    @staticmethod
-    def summarize_for_prompt(
-        events: list,
-        *,
-        person: str | None = None,
-        include_household: bool = True,
-    ) -> list[str]:
-        try:
-            return summarize_for_prompt(
-                events,
-                person=person,
-                include_household=include_household,
-            )
-        except Exception:
-            log.debug(
-                "greeter calendar facade: summarize_for_prompt raised",
-                exc_info=True,
-            )
-            return []
-
-
-async def _greeter_llm_client(prompt: str) -> str:
-    """LLM adapter for ProactiveGreeter. Routes through the same ACP
-    client voice turns use. The resulting text is sent verbatim through
-    `_dispatch_say` (TTS-direct), so we don't want voice wrapping
-    applied here — what the greeter generates is exactly what Dotty
-    speaks. Failures bubble up to the greeter, which has its own
-    try/except + template fallback."""
-    return await asyncio.wait_for(
-        acp.prompt(prompt),
-        timeout=REQUEST_TIMEOUT_SEC,
-    )
-
-
-async def _greeter_tts_pusher(device_id: str, text: str) -> None:
-    """TTS adapter for ProactiveGreeter. Routes through the
-    /xiaozhi/admin/say endpoint which generates TTS server-side and
-    streams opus straight to the device WS — bypassing the ASR/LLM
-    pipeline entirely so the greeter's pre-generated text is spoken
-    verbatim. Errors are logged inside `_dispatch_say`; we add one
-    more guard so an exception here can NEVER reach the greeter
-    loop."""
-    try:
-        await _dispatch_say(device_id, text)
-    except Exception:
-        log.exception(
-            "greeter tts pusher: _dispatch_say raised "
-            "(device=%s)", device_id,
-        )
-
-
-# Lazily constructed in lifespan so unit-import of bridge.py stays cheap
-# (the greeter reads env on construction).
-_proactive_greeter: "ProactiveGreeter | None" = None  # noqa: F821
-
-# Household registry — single source of truth for who lives here. Loaded
-# from ~/.zeroclaw/household.yaml (overridable via HOUSEHOLD_YAML_PATH).
-# Hot-reloads on file mtime change. None == registry init failed; bridge
-# continues with no-one configured (every identity resolves to _household).
-_household_registry: "HouseholdRegistry | None" = None  # noqa: F821
-
-# Speaker resolver — Phase 1 of the family-companion identity work.
-# Combines self-ID phrases, calendar prefix, time-of-day, and (when
-# Layer 4 ships) face_recognized events into a single best-guess
-# `SpeakerResolution` per voice turn. None == disabled (no registry).
-_speaker_resolver: "SpeakerResolver | None" = None  # noqa: F821
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Reconcile voice-daemon model with smart_mode state before anything
-    # else — if the bridge was redeployed and config.toml drifted, this
-    # rewrites + schedules a restart so the daemon comes up on the right
-    # model. No-op when in sync.
-    try:
-        _reconcile_voice_model_at_startup()
-    except Exception:
-        log.exception("startup model reconcile raised — continuing anyway")
-    try:
-        async with app_lock:
-            await acp.ensure_alive()
-    except Exception:
-        log.exception("Initial ACP spawn failed — will retry on first request")
-    try:
-        await _refresh_caches()
-        log.info("context-primed weather=%r calendar_events=%d",
-                 _weather_cache["text"][:60] if _weather_cache["text"] else "(none)",
-                 len(_calendar_cache["events"]))
-    except Exception:
-        log.exception("Initial context fetch failed — will retry on first request")
-    # Phase 1.5 / 1.6: start perception subscriber tasks
-    perception_tasks = [
-        asyncio.create_task(_perception_face_greeter()),
-        asyncio.create_task(_perception_wake_word_turner()),
-        asyncio.create_task(_perception_face_lost_aborter()),
-        asyncio.create_task(_perception_purr_player()),
-        asyncio.create_task(_perception_face_identified_refresher()),
-    ]
-    # Security state capture loop — text-only photo + audio every
-    # SECURITY_CAPTURE_INTERVAL_SEC, JPEG/audio bytes discarded after
-    # VLM/ASR. See bridge/security_watch.py for the contract.
-    try:
-        from bridge.security_watch import (
-            run_security_consumer, set_vision_cache_writer,
-        )
-
-        def _security_vision_cache_writer(
-            device_id: str,
-            *,
-            jpeg_bytes: bytes,
-            description: str,
-            source: str = "security_capture",
-        ) -> None:
-            """Mutate _vision_cache from a security cycle. The dashboard's
-            /ui/host/robot/photo/{mac} endpoint then serves the JPEG and
-            the new /ui/security/recent/{mac} panel surfaces the source
-            label so the operator can tell apart room_view vs security
-            captures. In-memory only — no disk write — per the user's
-            text-only-storage constraint for media."""
-            try:
-                _vision_cache[device_id] = {
-                    "description": description or "",
-                    "timestamp": perf_counter(),
-                    "wall_ts": time.time(),
-                    "jpeg_bytes": jpeg_bytes,
-                    "question": "security capture",
-                    "room_match_person_id": None,
-                    "source": source,
-                }
-            except Exception:
-                log.warning("security vision_cache write failed", exc_info=True)
-
-        set_vision_cache_writer(_security_vision_cache_writer)
-        perception_tasks.append(asyncio.create_task(
-            run_security_consumer(_perception_subscribe, _perception_unsubscribe)
-        ))
-    except Exception:
-        log.exception("security capture consumer failed to start")
-    # sound_turner disabled by default — on-device SoundLocalizer has a
-    # stuck-left bias (balance saturates at ~0.998), causing the head to
-    # snap to yaw=-45 every few seconds. Re-enable once the firmware
-    # localizer has a calibrated L/R baseline.
-    if os.environ.get("DOTTY_SOUND_TURNER_ENABLED", "0") == "1":
-        perception_tasks.append(asyncio.create_task(_perception_sound_turner()))
-    else:
-        log.info("perception sound turner disabled (DOTTY_SOUND_TURNER_ENABLED!=1)")
-    # Scene synthesis — periodic + event-triggered "current environment"
-    # writer. Reads _vision_cache / _audio_cache / _perception_state,
-    # writes a one-line synthesis to a daily NDJSON ring file. Always
-    # safe to run; emits only when there's at least vision-or-audio
-    # signal to summarise.
-    perception_tasks.append(asyncio.create_task(_scene_synthesis_loop()))
-    # Idle photographer — silent take_photo every 3–5 min while idle.
-    # Notable descriptions land in perception-YYYY-MM-DD.ndjson for
-    # later FTS ingestion. Toggle with IDLE_PHOTOGRAPHER_ENABLED.
-    if IDLE_PHOTOGRAPHER_ENABLED:
-        perception_tasks.append(
-            asyncio.create_task(_perception_idle_photographer())
-        )
-    else:
-        log.info("perception idle photographer disabled (IDLE_PHOTOGRAPHER_ENABLED!=1)")
-    # Sleep dreamer — on state→sleep, schedule N dreams across the
-    # estimated sleep window. Cancels on early wake. Writes summaries
-    # + full text to dreams-YYYY-MM-DD.ndjson.
-    if DREAMER_ENABLED:
-        perception_tasks.append(
-            asyncio.create_task(_perception_sleep_dreamer())
-        )
-    else:
-        log.info("perception sleep dreamer disabled (DREAMER_ENABLED!=1)")
-    # Dance reflector — on dance_ended, fire a short narrative LLM
-    # reflection. Silent. Writes to dances-YYYY-MM-DD.ndjson.
-    if DANCE_REFLECTOR_ENABLED:
-        perception_tasks.append(
-            asyncio.create_task(_perception_dance_reflector())
-        )
-    else:
-        log.info("perception dance reflector disabled (DANCE_REFLECTOR_ENABLED!=1)")
-    # Layer 5: background calendar refresher (no-op when CALENDAR_IDS empty).
-    calendar_task = asyncio.create_task(_calendar_poll_loop())
-
-    # Household registry — load before the greeter so it can enrich
-    # greetings with display name, persona, and birthday awareness. A
-    # missing/malformed file leaves the registry empty, not absent.
-    global _household_registry
-    try:
-        from bridge.household import HouseholdRegistry
-        _household_registry = HouseholdRegistry()
-        log.info(
-            "household registry loaded from %s (%d people)",
-            _household_registry.path,
-            len(tuple(_household_registry.iter())),
-        )
-    except Exception:
-        log.exception(
-            "HouseholdRegistry init failed — continuing without it",
-        )
-        _household_registry = None
-
-    # Speaker resolver — needs the registry to be useful, but can be
-    # constructed even with an empty one (it'll just always fall back).
-    # The resolver itself is dependency-light so failures here are
-    # extremely unlikely; defensive try/except matches the pattern used
-    # by every other lifespan-init component.
-    global _speaker_resolver
-    try:
-        from bridge.speaker import SpeakerResolver
-        _speaker_resolver = SpeakerResolver(
-            registry=_household_registry,
-            calendar_provider=lambda: (_calendar_cache.get("events") or []),
-            # perception_provider stays None until Phase 4 (face-rec
-            # firmware) ships — no recent-events buffer to pull from yet.
-            perception_provider=None,
-        )
-        log.info("SpeakerResolver initialised (sticky=%.0fs ask_threshold=%.2f)",
-                 _speaker_resolver.sticky_seconds,
-                 _speaker_resolver.ask_threshold)
-    except Exception:
-        log.exception(
-            "SpeakerResolver init failed — voice turns will use legacy path",
-        )
-        _speaker_resolver = None
-
-    # Layer 6: proactive greeter. Defensive — a construct-or-start failure
-    # must never block the bridge from booting (voice path comes first).
-    global _proactive_greeter
-    try:
-        from bridge.proactive_greeter import ProactiveGreeter
-        _proactive_greeter = ProactiveGreeter(
-            perception_bus=_PerceptionBusAdapter(),
-            llm_client=_greeter_llm_client,
-            calendar_cache=_CalendarFacade(),
-            tts_pusher=_greeter_tts_pusher,
-            kid_mode_provider=lambda: KID_MODE,
-            household_registry=_household_registry,
-            turn_logger=_convo_log.log_turn,
-        )
-        _proactive_greeter.start()
-    except Exception:
-        log.exception(
-            "ProactiveGreeter start failed — continuing without it",
-        )
-        _proactive_greeter = None
-
-    yield
-    for t in perception_tasks:
-        t.cancel()
-    calendar_task.cancel()
-    await asyncio.gather(*perception_tasks, calendar_task, return_exceptions=True)
-    if _proactive_greeter is not None:
-        try:
-            await _proactive_greeter.stop()
-        except Exception:
-            log.exception("ProactiveGreeter.stop() raised")
-    await acp.shutdown()
-
-
-app = FastAPI(title="ZeroClaw Bridge", lifespan=lifespan)
-app.add_middleware(CSRFMiddleware)
-
-# Prometheus exposition. Mounted as an ASGI sub-app so it shares the
-# bridge's listener — keep that listener LAN-only (bind 0.0.0.0 on a
-# private network or 127.0.0.1 + a reverse proxy). NEVER expose /metrics
-# to the public internet; it leaks operational details about the host.
-if _METRICS_AVAILABLE and metrics_app is not None:
-    try:
-        app.mount("/metrics", metrics_app())
-        log.info("Prometheus /metrics mounted")
-    except Exception:
-        log.exception("metrics mount failed — /metrics will be unavailable")
-
-try:
-    from bridge.dashboard import router as _dashboard_router, configure as _configure_dashboard
-    app.include_router(_dashboard_router)
-except Exception:
-    log.exception("dashboard mount failed — admin UI at /ui will be unavailable")
-    _configure_dashboard = None  # type: ignore[assignment]
-
-# Vendored JS/CSS + PWA icons for the dashboard. Served same-origin so we
-# can attach SRI to the <script>/<link> tags and drop the third-party CDNs
-# (htmx.org / cdn.jsdelivr.net / cdn.tailwindcss.com). Re-build the
-# tailwind bundle with `npm run build:css` after editing templates.
-try:
-    from fastapi.staticfiles import StaticFiles as _StaticFiles
-    from pathlib import Path as _Path
-    _STATIC_DIR = _Path(__file__).parent / "bridge" / "static"
-    if _STATIC_DIR.is_dir():
-        app.mount("/ui/static", _StaticFiles(directory=str(_STATIC_DIR)), name="ui-static")
-    else:
-        log.warning("dashboard static dir missing at %s — vendored assets will 404", _STATIC_DIR)
-except Exception:
-    log.exception("dashboard static mount failed — vendored assets at /ui/static will be unavailable")
-
-
-@app.get("/health")
-async def health() -> dict:
-    proc_ok = acp._proc is not None and acp._proc.returncode is None
-    return {
-        "status": "ok",
-        "service": "zeroclaw-bridge",
-        "acp_running": proc_ok,
-        "cached_session": acp._sid is not None,
-        "session_turns": acp._sid_turns,
-    }
-
-
-@app.get("/api/calendar/today")
-async def calendar_today(
-    person: str | None = None,
-    include_household: bool = True,
-) -> dict:
-    """LAN endpoint for today's calendar events.
-
-    Routes through `summarize_for_prompt` so the response carries the
-    same privacy guarantees as prompt injection: no ISO timestamps, no
-    email addresses, no raw calendar IDs. Intended for the firmware /
-    dashboard UI; deliberately NOT registered as an MCP tool because the
-    firmware-side `MCP_TOOL_ALLOWLIST` is closed and we want this stay
-    a passive read endpoint, not something the LLM can call.
-    """
-    t0 = perf_counter()
-    err_kind: str | None = None
-    try:
-        # Triggers a lazy refresh if the cache is stale or the day rolled.
-        await _refresh_caches()
-        events = _calendar_cache.get("events") or []
-        cleaned = summarize_for_prompt(
-            events, person=person, include_household=include_household,
-        )
-        return {
-            "ok": True,
-            "date": _calendar_cache.get("date", ""),
-            "fetched": _calendar_cache.get("fetched", 0.0),
-            "consecutive_failures": _calendar_cache.get("consecutive_failures", 0),
-            "person": person,
-            "include_household": include_household,
-            "events": cleaned,
-            "count": len(cleaned),
-        }
-    except Exception:
-        err_kind = "exception"
-        raise
-    finally:
-        if _METRICS_AVAILABLE:
-            _safe_metric(
-                dotty_request_duration_seconds.labels(
-                    endpoint="calendar_today",
-                ).observe,
-                perf_counter() - t0,
-            )
-            if err_kind:
-                _safe_metric(
-                    dotty_request_errors_total.labels(
-                        endpoint="calendar_today", kind=err_kind,
-                    ).inc,
-                )
-
-
-# ---------------------------------------------------------------------------
-# Perception — ambient event ingest (Phase 1)
-# ---------------------------------------------------------------------------
-
-
-class PerceptionEventIn(BaseModel):
-    device_id: str = "unknown"
-    ts: float | None = None
-    name: str
-    data: dict = {}
-
-
-@app.post("/api/perception/event", status_code=204)
-async def perception_event(payload: PerceptionEventIn) -> None:
-    """Ingest an ambient-perception event. Producers: firmware (via the
-    xiaozhi-server relay) for face_detected / face_lost / sound_event,
-    later phases add server-side audio scene + vision classifiers.
-    Updates per-device state and broadcasts to all in-process
-    subscribers (no consumers in Phase 1.1; added in 1.5 / 1.6)."""
-    t0 = perf_counter()
-    err_kind: str | None = None
-    try:
-        ts = payload.ts if payload.ts is not None else time.time()
-        event = {
-            "device_id": payload.device_id,
-            "ts": ts,
-            "name": payload.name,
-            "data": payload.data or {},
-        }
-        _update_perception_state(
-            payload.device_id, payload.name, event["data"], ts,
-        )
-        _perception_broadcast(event)
-        log.info(
-            "perception event: device=%s name=%s data=%s",
-            payload.device_id, payload.name, event["data"],
-        )
-        return None
-    except Exception:
-        err_kind = "exception"
-        raise
-    finally:
-        if _METRICS_AVAILABLE:
-            _safe_metric(
-                dotty_request_duration_seconds.labels(
-                    endpoint="perception_event",
-                ).observe,
-                perf_counter() - t0,
-            )
-            if err_kind:
-                _safe_metric(
-                    dotty_request_errors_total.labels(
-                        endpoint="perception_event", kind=err_kind,
-                    ).inc,
-                )
-
-
-@app.get("/api/perception/state")
-async def perception_state(device_id: str = "") -> dict:
-    """Debug introspection — current per-device perception state.
-    Used by Phase 1 verification + later by the dashboard.
-
-    Each device entry is annotated with:
-      sensor_stale  – True when no event has arrived within
-                      _PERCEPTION_STALE_THRESHOLD_S seconds (or the
-                      device has never sent an event).
-      sensor_age_s  – Seconds since the last event (float("inf") when
-                      last_event_t is absent).
-    """
-    now = time.time()
-
-    def _annotate(raw: dict) -> dict:
-        out = dict(raw)
-        last_t = out.get("last_event_t")
-        if last_t is None:
-            age = float("inf")
-        else:
-            age = max(0.0, now - last_t)
-        out["sensor_age_s"] = age
-        out["sensor_stale"] = age > _PERCEPTION_STALE_THRESHOLD_S
-        return out
-
-    if device_id:
-        return {device_id: _annotate(_perception_state.get(device_id, {}))}
-    return {did: _annotate(s) for did, s in _perception_state.items()}
-
-
-@app.get("/api/perception/feed")
-async def perception_feed(request: Request) -> StreamingResponse:
-    """Server-Sent Events stream of live perception events.
-
-    Each event arrives as:
-        data: {"name": "...", "data": {...}, "device_id": "...", "ts": 1234.5}\\n\\n
-
-    A keepalive comment (`: keepalive`) is sent every 15 s when idle.
-    Connect with EventSource('/api/perception/feed') from the browser.
-    """
-    queue = _perception_subscribe()
-
-    async def _generate():
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    payload = {
-                        "name": event.get("name", ""),
-                        "data": event.get("data", {}),
-                        "device_id": event.get("device_id", ""),
-                        "ts": event.get("ts", 0.0),
-                    }
-                    yield f"data: {json.dumps(payload)}\n\n"
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-        finally:
-            _perception_unsubscribe(queue)
-
-    return StreamingResponse(
-        _generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
-# ---------------------------------------------------------------------------
-# Vision — photo description via OpenRouter VLM
-# ---------------------------------------------------------------------------
-
-_vision_cache: dict[str, dict] = {}
-_vision_events: dict[str, list[asyncio.Event]] = {}
-
-# Audio caption cache — populated by POST /api/audio/explain. Mirrors
-# _vision_cache shape but holds no raw audio bytes (caption text is the
-# only durable surface; raw audio stays in the request body and is GC'd
-# after the captioning call returns).
-_audio_cache: dict[str, dict] = {}
-
-# Per-device snapshot of the most recent scene synthesis — written by
-# _scene_synthesis_loop, read by the dashboard's Perception card. Text
-# only; the NDJSON sink under CONVO_LOG_DIR is the durable record.
-_scene_synthesis_cache: dict[str, dict] = {}
-
-# Per-device snapshot of the most recent user voice line (post-ASR) so
-# the dashboard's Perception "Sound" section can render "Said: …" without
-# tailing the convo NDJSON. Populated at /api/message + /api/message/stream
-# entry; the NDJSON sink remains the durable record.
-_LAST_USER_LINE_MAX_CHARS = 512
-_last_user_line_cache: dict[str, dict] = {}
-
-
-def _record_last_user_line(device_id: str | None, text: str) -> None:
-    if not device_id:
-        return
-    cleaned = (text or "").strip()
-    if not cleaned:
-        return
-    if len(cleaned) > _LAST_USER_LINE_MAX_CHARS:
-        cleaned = cleaned[: _LAST_USER_LINE_MAX_CHARS - 1] + "…"
-    _last_user_line_cache[device_id] = {
-        "text": cleaned,
-        "wall_ts": time.time(),
-    }
-
-
-def _get_last_user_line(device_id: str) -> dict | None:
-    return _last_user_line_cache.get(device_id)
-
-def _call_narrative_llm(
-    user_prompt: str,
-    *,
-    system_prompt: str,
-    model: str = NARRATIVE_MODEL,
-    max_tokens: int = 1200,
-    temperature: float = 0.9,
-    timeout_s: float = NARRATIVE_TIMEOUT_SEC,
-) -> str | None:
-    """Direct OpenRouter text-LLM call for internal narrative writes.
-
-    Used for dreams, dance reflections, story summaries, and any other
-    introspective text Dotty produces about their own experience.
-    Bypasses ZeroClaw + the kid-mode sandwich — these are not voice
-    output, they're cached narrative for memory.
-
-    Returns the model's text response on success, or None on failure
-    (network error, missing API key, malformed response). Callers
-    treat None as "skip this write" rather than crashing the consumer.
-
-    Higher temperature than VLM (0.9 vs 0.3) — narrative wants
-    literary variation, not perceptual stability.
-    """
-    import requests as req
-
-    if not VISION_API_KEY:
-        log.warning("narrative LLM: VISION_API_KEY not set; skipping")
-        return None
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    try:
-        resp = req.post(
-            VISION_API_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {VISION_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=timeout_s,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        log.exception("narrative LLM call failed (model=%s)", model)
-        return None
-
-
-# `_call_vision_api` never raises — it swallows request/timeout errors and
-# returns one of these sentinel strings, so the upstream LLM receives an
-# explicit "vision is unavailable" instruction instead of confabulating a
-# description. The sentinels double as the dashboard failure-aggregator's
-# classification keys — see `_classify_vision_result` (#74).
-_VISION_ERR_NO_KEY = (
-    "ERROR: my camera is offline right now. Tell the user the vision "
-    "system is unavailable and do not guess at what the photo shows."
-)
-_VISION_ERR_API = (
-    "ERROR: the vision service didn't respond. Tell the user you "
-    "couldn't process the photo and do not guess at what it shows."
-)
-
-
-def _call_vision_api(
-    b64_image: str, question: str, *,
-    system_prompt: str = VISION_SYSTEM_PROMPT,
-) -> str:
-    import requests as req
-
-    # Missing-key path is loud + unambiguous so the upstream LLM can't confabulate
-    # a description around a soft-fail string. Observed 2026-05-10: bare "I
-    # couldn't quite see that clearly" let xiaozhi's LLM invent "It's a sunny
-    # day outside" with zero camera input.
-    if not VLM_API_KEY:
-        log.error(
-            "VLM call aborted — VLM_API_KEY/VISION_API_KEY/OPENROUTER_API_KEY "
-            "all unset; set one in zeroclaw-bridge.service Environment="
-        )
-        return _VISION_ERR_NO_KEY
-    payload = {
-        "model": VLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
-                    },
-                    {"type": "text", "text": question},
-                ],
-            },
-        ],
-        "max_tokens": 200,
-        "temperature": 0.3,
-    }
-    try:
-        resp = req.post(
-            VLM_API_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {VLM_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=VISION_TIMEOUT_SEC,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        log.exception("vision API call failed")
-        return _VISION_ERR_API
-
-
-def _classify_vision_result(text: str | None) -> str | None:
-    """Map a `_call_vision_api` return value to a dashboard failure kind
-    (#74), or None when the call succeeded.
-
-    `_call_vision_api` swallows its own request/timeout exceptions and
-    returns an `ERROR:` sentinel *string* rather than raising — so a dead
-    or unconfigured vision service reaches `vision_explain` as an ordinary
-    return. Without this the aggregator would only ever see the rare
-    `err_kind="exception"` and miss the most common real failure mode:
-    the VLM endpoint not responding."""
-    if text == _VISION_ERR_NO_KEY:
-        return "camera_offline"   # VLM API key unset — a config error
-    if text == _VISION_ERR_API:
-        return "vision_api"       # request failed / non-2xx / bad body
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Room-view roster identification — description + 4-member name match
-# ---------------------------------------------------------------------------
-# Sentinel question from the xiaozhi side opts in to this path (see
-# `_ROOM_VIEW_SENTINEL` above). The bridge builds the roster-aware
-# question from the household registry on every call so YAML edits are
-# picked up without restart.
-
-# The exact reply format the VLM is asked to produce. Pinned to one
-# line so a streaming or partial completion still parses; `DESC: ` and
-# `NAME: ` are explicit markers the parser anchors on.
-_ROOM_VIEW_PROMPT_TEMPLATE = (
-    "Look at this photo and do THREE things in one reply.\n"
-    "\n"
-    "1. Describe the person in ONE short sentence — approximate age "
-    "range, hair, clothing, distinguishing features.\n"
-    "2. If the person clearly matches one of these family members, "
-    "give that exact name. Otherwise reply with the name 'unknown'.\n"
-    "3. Read the person's apparent mood — pick exactly one of: "
-    "engaged, tired, excited, distressed, neutral.\n"
-    "\n"
-    "Family:\n"
-    "{roster}\n"
-    "\n"
-    "Reply on a SINGLE line in this exact format:\n"
-    "DESC: <one sentence> | NAME: <{name_choices}|unknown> | MOOD: <engaged|tired|excited|distressed|neutral>\n"
-    "\n"
-    "If you cannot see a person at all, reply with exactly: no one in view\n"
-    "Do not invent names. Do not add commentary."
-)
-# Sentinel reply for empty frames — same string the v1 prompt used,
-# so existing log-grep regexes keep working.
-_ROOM_VIEW_NO_PERSON = "no one in view"
-# Parser regex. Anchored at start, allows whitespace flexibility, and
-# tolerates trailing punctuation around the name (e.g. `NAME: Hudson.`).
-_ROOM_VIEW_RESP_RE = re.compile(
-    r"^\s*DESC:\s*(?P<desc>.+?)\s*"
-    r"\|\s*NAME:\s*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s*"
-    # Accept ANY single-word MOOD value here so an out-of-vocab reply
-    # ("chaotic") still parses the desc + name cleanly — the parser
-    # validates the vocab and drops invalid moods to None.
-    r"(?:\|\s*MOOD:\s*(?P<mood>[A-Za-z]+)\s*)?"
-    r"[.!?]?\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-_ROOM_VIEW_MOODS = frozenset(
-    {"engaged", "tired", "excited", "distressed", "neutral"}
-)
-
-
-def _build_room_view_question() -> Optional[str]:
-    """Build the roster-aware room_view prompt from the household
-    registry. Returns None when the registry is unavailable or has no
-    members with `appearance:` set — caller should fall back to the
-    v1 description-only prompt."""
-    if _household_registry is None:
-        return None
-    try:
-        roster = _household_registry.render_roster_for_vlm()
-    except Exception:
-        log.exception("room_view: render_roster_for_vlm raised")
-        return None
-    if not roster.strip():
-        return None
-    try:
-        name_choices = "|".join(sorted(
-            p.display_name for p in _household_registry.iter()
-            if (p.appearance or "").strip()
-        ))
-    except Exception:
-        log.exception("room_view: roster name iteration raised")
-        return None
-    return _ROOM_VIEW_PROMPT_TEMPLATE.format(
-        roster=roster, name_choices=name_choices,
-    )
-
-
-def _parse_room_view_response(
-    raw: str, roster_ids: set[str],
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Parse the VLM's room_view reply into `(description, person_id, mood)`.
-
-    Behaviour:
-      * Empty input  → (None, None, None)
-      * "no one in view" sentinel → (None, None, None)
-      * Format match + name in roster → (desc, person_id, mood_or_None)
-      * Format match + name == "unknown" or off-roster → (desc, None, mood_or_None)
-      * Format mismatch → (raw_stripped, None, None) — graceful degrade
-        to v1 behaviour so we never lose the description signal even
-        when the model deviates from the requested format.
-
-    `mood` is None when the model omits the MOOD: field (older replies)
-    or returns a value outside the fixed vocabulary. The MOOD field is
-    optional in the regex precisely so older / non-conforming replies
-    still parse cleanly.
-    """
-    if not raw:
-        return None, None, None
-    cleaned = raw.strip()
-    if not cleaned:
-        return None, None, None
-    if _ROOM_VIEW_NO_PERSON in cleaned.lower():
-        return None, None, None
-    m = _ROOM_VIEW_RESP_RE.match(cleaned)
-    if not m:
-        # Fall back: treat the whole reply as a description. Mirrors the
-        # v1 path so a botched format never costs us the description.
-        return cleaned, None, None
-    desc = m.group("desc").strip()
-    name = m.group("name").strip().lower()
-    raw_mood = (m.group("mood") or "").strip().lower()
-    mood = raw_mood if raw_mood in _ROOM_VIEW_MOODS else None
-    if not desc:
-        desc = None  # paranoid — regex requires non-empty
-    if name == "unknown" or name not in roster_ids:
-        return desc, None, mood
-    return desc, name, mood
-
-
-@app.post("/api/vision/explain")
-async def vision_explain(
-    request: Request,
-    question: str = Form("What do you see?"),
-    file: UploadFile = File(...),
-):
-    t0 = perf_counter()
-    err_kind: str | None = None
-    try:
-        device_id = request.headers.get("device-id", "unknown")
-        jpeg_bytes = await file.read()
-        log.info(
-            "vision device=%s question=%s bytes=%d",
-            device_id, question[:80], len(jpeg_bytes),
-        )
-        b64_image = base64.b64encode(jpeg_bytes).decode("ascii")
-
-        # Room-view roster identification opt-in. The xiaozhi side
-        # sends the sentinel in the `question` field when it wants the
-        # bridge to substitute its roster-aware prompt + parse the
-        # combined description-and-name reply. Falls back to the v1
-        # description-only path if the registry is empty / unavailable
-        # so the existing room_view behaviour is preserved.
-        room_view_question = (
-            _build_room_view_question() if question == _ROOM_VIEW_SENTINEL
-            else None
-        )
-        room_match_person_id: str | None = None
-        if room_view_question is not None:
-            # Idle photo cooldown — skip the VLM call if we've already
-            # captured an autonomous photo for this device within the
-            # cooldown window. Cache + waiter wake still happen so the
-            # firmware doesn't time out on /api/vision/latest.
-            wall_now = time.time()
-            state = _perception_state.setdefault(device_id, {})
-            last_capture = state.get("last_room_view_capture_t", 0.0)
-            cooldown_age = wall_now - last_capture
-            dance_active = _is_dance_active(device_id)
-            # Talk-active gate: skip room_view VLM during an active
-            # conversation. The xiaozhi-side textMessageHandlerRegistry
-            # already short-circuits face_detected → take_photo when
-            # current_state == "talk", so this branch only fires for
-            # photos arriving via other paths (idle photographer,
-            # security_watch, manual MCP). Belt-and-braces — keep both
-            # gates because the bridge sees photos that the xiaozhi side
-            # never spawned. Listening included so a wake-word turn that
-            # opens the mic before state has fully transitioned still
-            # gates correctly.
-            current_state = (state.get("current_state") or "idle").lower()
-            listening = bool(state.get("listening"))
-            last_state_change_t = state.get("last_state_change_t", 0.0)
-            # Allow the kickoff capture of a fresh talk turn through —
-            # see ROOM_VIEW_TALK_KICKOFF_GRACE_SEC docstring. Note that
-            # `listening` is True during the kickoff (the firmware enters
-            # LISTENING state immediately after wake), so it cannot be a
-            # disqualifier here. Subsequent face_detected events during
-            # the same turn arrive >grace seconds after the transition and
-            # stay gated regardless of listening flag.
-            talk_kickoff = (
-                current_state == "talk"
-                and (wall_now - last_state_change_t)
-                    < ROOM_VIEW_TALK_KICKOFF_GRACE_SEC
-            )
-            talk_active = (
-                (current_state == "talk" or listening)
-                and not talk_kickoff
-            )
-            if dance_active or talk_active or cooldown_age < DOTTY_IDLE_VISION_COOLDOWN_SEC:
-                if dance_active:
-                    log.info(
-                        "room_view skipped: device=%s reason=dance_active",
-                        device_id,
-                    )
-                elif talk_active:
-                    log.info(
-                        "room_view skipped: device=%s reason=talk_active "
-                        "(state=%s listening=%s age=%.2fs)",
-                        device_id, current_state, listening,
-                        wall_now - last_state_change_t,
-                    )
-                else:
-                    log.info(
-                        "room_view skipped: device=%s cooldown=%.1fs/%.0fs",
-                        device_id, cooldown_age,
-                        DOTTY_IDLE_VISION_COOLDOWN_SEC,
-                    )
-                description = _ROOM_VIEW_NO_PERSON
-                _vision_cache[device_id] = {
-                    "description": description,
-                    "timestamp": perf_counter(),
-                    "wall_ts": time.time(),
-                    "jpeg_bytes": jpeg_bytes,
-                    "question": question,
-                    "room_match_person_id": None,
-                    "source": "room_view",
-                }
-                for ev in _vision_events.get(device_id, ()):
-                    ev.set()
-                return {"description": description}
-            state["last_room_view_capture_t"] = wall_now
-            roster_ids = (
-                _household_registry.roster_ids_with_appearance()
-                if _household_registry is not None else set()
-            )
-            raw = await asyncio.to_thread(
-                _call_vision_api, b64_image, room_view_question,
-                system_prompt=VISION_ROOM_VIEW_SYSTEM_PROMPT,
-            )
-            parsed_desc, room_match_person_id, parsed_mood = (
-                _parse_room_view_response(raw, roster_ids)
-            )
-            description = parsed_desc or _ROOM_VIEW_NO_PERSON
-            if parsed_mood:
-                # Plumb mood into perception state so the talk-turn
-                # PerceptionSnapshot picks it up. TTL-bound — read sites
-                # check `face_mood_t` against FACE_IDENTITY_TTL_SEC (mood
-                # lives or dies with the identification it was attached to).
-                pstate = _perception_state.setdefault(device_id, {})
-                pstate["face_mood"] = parsed_mood
-                pstate["face_mood_t"] = time.time()
-            log.info(
-                "room_view device=%s match=%s mood=%s desc=%s",
-                device_id, room_match_person_id or "-",
-                parsed_mood or "-", description[:120],
-            )
-        else:
-            # v1 path — either a normal "what do you see" call, OR a
-            # sentinel call that fell back because the registry is
-            # empty (no roster to choose from).
-            if question == _ROOM_VIEW_SENTINEL:
-                question = (
-                    "Describe the person you can see in one short "
-                    "sentence — approximate age range, hair, clothing, "
-                    "distinguishing features. If you cannot see a "
-                    "person, reply with exactly: no one in view. "
-                    "Do not guess names."
-                )
-            description = await asyncio.to_thread(
-                _call_vision_api, b64_image, question,
-            )
-
-        _vision_cache[device_id] = {
-            "description": description,
-            "timestamp": perf_counter(),
-            "wall_ts": time.time(),
-            "jpeg_bytes": jpeg_bytes,
-            "question": question,
-            "room_match_person_id": room_match_person_id,
-            "source": "room_view",
-        }
-        # Wake every waiter polling this device. Concurrent callers
-        # (room-view capture from textMessageHandlerRegistry + voice
-        # "what do you see" from receiveAudioHandle) both legitimately
-        # poll vision_latest for the same device_id; the previous
-        # single-event-per-device pattern lost the first waiter when
-        # the second one overwrote the dict entry.
-        for ev in _vision_events.get(device_id, ()):
-            ev.set()
-
-        # Layer 6 hook — when room-view resolves to a roster member,
-        # broadcast a synthetic `face_recognized` event so perception-bus
-        # consumers (notably ProactiveGreeter) see the resolved identity.
-        # Without this the person_id stays trapped on the connection and
-        # only reaches the next voice turn — never the bus.
-        if room_match_person_id:
-            _perception_broadcast({
-                "name": "face_recognized",
-                "device_id": device_id,
-                "ts": time.time(),
-                "data": {
-                    "identity": room_match_person_id,
-                    "source": "room_view",
-                },
-            })
-
-        now = perf_counter()
-        for k in [k for k, v in _vision_cache.items() if now - v["timestamp"] > VISION_CACHE_TTL_SEC]:
-            _vision_cache.pop(k, None)
-
-        # A failed VLM call returns an `ERROR:` sentinel string rather
-        # than raising (see `_call_vision_api`), so classify the final
-        # description for the dashboard failure aggregator (#74) —
-        # otherwise the most common failure mode never reaches the count.
-        err_kind = _classify_vision_result(description)
-        log.info("vision result device=%s desc=%s", device_id, description[:120])
-        return {"description": description}
-    except Exception:
-        err_kind = "exception"
-        raise
-    finally:
-        if err_kind:
-            _vision_failure_record(err_kind)
-        if _METRICS_AVAILABLE:
-            _safe_metric(
-                dotty_request_duration_seconds.labels(
-                    endpoint="vision_explain",
-                ).observe,
-                perf_counter() - t0,
-            )
-            if err_kind:
-                _safe_metric(
-                    dotty_request_errors_total.labels(
-                        endpoint="vision_explain", kind=err_kind,
-                    ).inc,
-                )
-
-
-@app.get("/api/vision/latest/{device_id}")
-async def vision_latest(device_id: str):
-    _vision_cache.pop(device_id, None)
-    event = asyncio.Event()
-    waiters = _vision_events.setdefault(device_id, [])
-    waiters.append(event)
-    try:
-        await asyncio.wait_for(event.wait(), timeout=15.0)
-        entry = _vision_cache.get(device_id)
-        if entry:
-            # `room_match_person_id` is None for the v1 description-only
-            # path and either a roster id (string) or None for the v2
-            # room_view roster path. Returned alongside `description` so
-            # the caller can shuttle both into the [ROOM_VIEW] marker
-            # (see `_with_room_view_marker` on the xiaozhi side).
-            return {
-                "description": entry["description"],
-                "room_match_person_id": entry.get("room_match_person_id"),
-            }
-        return JSONResponse(status_code=500, content={"error": "vision processing failed"})
-    except asyncio.TimeoutError:
-        return JSONResponse(status_code=404, content={"error": "no vision result in time"})
-    finally:
-        try:
-            waiters.remove(event)
-        except ValueError:
-            pass
-        if not waiters:
-            _vision_events.pop(device_id, None)
-
-
-# ---------------------------------------------------------------------------
-# Audio captioning — security-framed "what does Dotty hear" describer
-# ---------------------------------------------------------------------------
-# Mirrors the vision pipeline above. POST a short audio clip (wav/mp3/
-# opus/flac, base64-encoded under the OpenAI-style `input_audio` content
-# block) to an audio-capable model on OpenRouter, cache the textual
-# caption, broadcast a synthetic perception event so the dashboard
-# refreshes. Raw audio bytes are NOT held in the cache — only the text.
-# Phase A: callable by curl now. Phase B (firmware capture relay) lands
-# in a separate change.
-
-# Best-effort guess of the OpenAI-compatible audio format string from a
-# multipart UploadFile. Defaults to "wav" because that's what we'll send
-# from the firmware once the capture path lands. OpenRouter routes
-# "wav" / "mp3" / "opus" / "flac" through to the underlying model.
-_AUDIO_FMT_BY_CONTENT_TYPE = {
-    "audio/wav": "wav",
-    "audio/x-wav": "wav",
-    "audio/wave": "wav",
-    "audio/mpeg": "mp3",
-    "audio/mp3": "mp3",
-    "audio/ogg": "opus",
-    "audio/opus": "opus",
-    "audio/flac": "flac",
-    "audio/x-flac": "flac",
+# Tools the firmware advertises via WebSocket handshake. The voice/MCP path
+# that read this list lived inside ZeroClaw and is gone post-#36; the
+# allowlist literal is kept here because /admin/safety mutates it in-place
+# and external operator scripts may still treat bridge.py as the source of
+# truth. Markers below bound the literal so the rewrite stays deterministic.
+# === ADMIN_ALLOWLIST_START ===
+MCP_TOOL_ALLOWLIST: set[str] = {
+    "get_device_status",
+    "audio_speaker.set_volume",
+    "screen.set_brightness",
+    "screen.set_theme",
+    "robot.get_head_angles",
+    "robot.set_head_angles",
+    "robot.set_led_color",
+    "robot.create_reminder",
+    "robot.get_reminders",
+    "robot.stop_reminder",
 }
-
-
-def _audio_format_from_upload(file: UploadFile) -> str:
-    ct = (file.content_type or "").lower().strip()
-    if ct in _AUDIO_FMT_BY_CONTENT_TYPE:
-        return _AUDIO_FMT_BY_CONTENT_TYPE[ct]
-    name = (file.filename or "").lower()
-    for ext, fmt in (
-        (".wav", "wav"), (".mp3", "mp3"), (".ogg", "opus"),
-        (".opus", "opus"), (".flac", "flac"),
-    ):
-        if name.endswith(ext):
-            return fmt
-    return "wav"
-
-
-def _call_audio_caption_api(
-    b64_audio: str, fmt: str, question: str, *,
-    system_prompt: str = AUDIO_CAPTION_SYSTEM_PROMPT,
-) -> str:
-    """Synchronous OpenRouter call. Wrapped via asyncio.to_thread by the
-    endpoint so it doesn't block the event loop. Mirrors the shape of
-    `_call_vision_api` so the failure modes look the same to operators."""
-    import requests as req
-
-    if not AUDIO_CAPTION_API_KEY:
-        log.warning("AUDIO_CAPTION_API_KEY not set")
-        return "I couldn't quite hear that clearly."
-    payload = {
-        "model": AUDIO_CAPTION_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": b64_audio, "format": fmt},
-                    },
-                    {"type": "text", "text": question},
-                ],
-            },
-        ],
-        "max_tokens": 200,
-        "temperature": 0.3,
-    }
-    try:
-        resp = req.post(
-            AUDIO_CAPTION_API_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {AUDIO_CAPTION_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=AUDIO_CAPTION_TIMEOUT_SEC,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception:
-        log.exception("audio caption API call failed")
-        return "I couldn't quite hear that clearly."
-
-
-@app.post("/api/audio/explain")
-async def audio_explain(
-    request: Request,
-    question: str = Form("Describe what you hear."),
-    file: UploadFile = File(...),
-):
-    t0 = perf_counter()
-    err_kind: str | None = None
-    try:
-        device_id = request.headers.get("device-id", "unknown")
-        audio_bytes = await file.read()
-        fmt = _audio_format_from_upload(file)
-        log.info(
-            "audio device=%s question=%s bytes=%d format=%s",
-            device_id, question[:80], len(audio_bytes), fmt,
-        )
-        b64_audio = base64.b64encode(audio_bytes).decode("ascii")
-        description = await asyncio.to_thread(
-            _call_audio_caption_api, b64_audio, fmt, question,
-        )
-        _audio_cache[device_id] = {
-            "description": description,
-            "timestamp": perf_counter(),
-            "wall_ts": time.time(),
-            "question": question,
-            "source": "audio_explain",
-        }
-        # Purge stale entries — same TTL-cleanup pattern as _vision_cache.
-        now = perf_counter()
-        for k in [
-            k for k, v in _audio_cache.items()
-            if now - v["timestamp"] > AUDIO_CACHE_TTL_SEC
-        ]:
-            _audio_cache.pop(k, None)
-
-        # Nudge the dashboard via the perception SSE feed so the new
-        # caption shows up without waiting for the next polling tick.
-        _perception_broadcast({
-            "name": "audio_captioned",
-            "device_id": device_id,
-            "ts": time.time(),
-            "data": {
-                "source": "audio_explain",
-                "preview": description[:80],
-            },
-        })
-
-        log.info("audio result device=%s desc=%s", device_id, description[:120])
-        return {"description": description}
-    except Exception:
-        err_kind = "exception"
-        raise
-    finally:
-        if _METRICS_AVAILABLE:
-            _safe_metric(
-                dotty_request_duration_seconds.labels(
-                    endpoint="audio_explain",
-                ).observe,
-                perf_counter() - t0,
-            )
-            if err_kind:
-                _safe_metric(
-                    dotty_request_errors_total.labels(
-                        endpoint="audio_explain", kind=err_kind,
-                    ).inc,
-                )
+# === ADMIN_ALLOWLIST_END ===
 
 
 # ---------------------------------------------------------------------------
-# Tier 2 voice escalation — bridge-side dispatcher for tool_calls emitted
-# by the slim Tier1Slim custom provider in xiaozhi-server. Three endpoints:
-#
-#   POST /api/voice/escalate    — synchronous tool dispatcher
-#   POST /api/voice/memory_log  — async turn log (fire-and-forget)
-#   POST /api/voice/remember    — async fact store (fire-and-forget)
-#
-# Memory ops bypass ZeroClaw's HTTP gateway (which requires a bearer auth
-# token that's stored encrypted in config) and read/write brain.db directly
-# via SQLite. Schema is stable — `memories(id, key, content, category,
-# namespace, ...)` with FTS5 triggers maintaining `memories_fts` on every
-# insert/update/delete. think_hard skips ACP entirely and hits llama-swap
-# directly with model=qwen3.6:27b-think — same speedup motivation as the
-# rest of the slim path, plus the 2026-05-15 llama-swap split puts the
-# small-context 27B in the `voice` matrix set so it stays resident
-# alongside qwen3.5:4b instead of evicting it on every escalation. See
-# audits/pi-rpc-spike-report.md and dotty-stackchan/docs/cookbook/
-# llama-swap-concurrent-models.md.
+# Per-person memory — dashboard /ui/memory backing store
+# ---------------------------------------------------------------------------
+# brain.db is the FTS5-only memory store written by dotty-pi-ext voice
+# tools. The dashboard's /ui/memory page lists every per-person row
+# (approved + pending review) and exposes approve / redact actions. The
+# bridge does NOT write to brain.db — it's a read + lifecycle-mutate
+# surface for the dashboard. See bridge/MEMORY-INDEX.md / brain-db-fts-only.md.
 
 _VOICE_MEMORY_DB = Path(os.environ.get(
     "VOICE_MEMORY_DB", "/root/.zeroclaw/workspace/memory/brain.db",
 ))
-_VOICE_THINKER_URL = os.environ.get(
-    "VOICE_THINKER_URL", "http://localhost:8080/v1/chat/completions",
-)
-_VOICE_THINKER_MODEL = os.environ.get("VOICE_THINKER_MODEL", "qwen3.6:27b-think")
-_VOICE_THINKER_TIMEOUT = float(os.environ.get("VOICE_THINKER_TIMEOUT", "30"))
-
-# #53 per-person memory — how many durable facts to load into a turn's
-# `[Person memory]` block. Direct `person:<id>` namespace fetch, not FTS.
-_PERSON_MEMORY_MAX_FACTS = int(os.environ.get("PERSON_MEMORY_MAX_FACTS", "8"))
-
-
-def _voice_memory_search_blocking(query: str, limit: int = 5) -> list[dict]:
-    """FTS5 search across `memories`. Read-only, WAL-friendly. Returns
-    top-N by rank, newest-leaning. Empty list on any error."""
-    import sqlite3
-    if not _VOICE_MEMORY_DB.exists():
-        log.warning("voice memory: db not found at %s", _VOICE_MEMORY_DB)
-        return []
-    safe = (query or "").replace('"', '""').strip()
-    if not safe:
-        return []
-    fts = f'"{safe}"'
-    try:
-        conn = sqlite3.connect(
-            f"file:{_VOICE_MEMORY_DB}?mode=ro", uri=True, timeout=2,
-        )
-        try:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                """
-                SELECT m.key, m.content, m.category, m.namespace, m.created_at
-                FROM memories_fts
-                JOIN memories m ON m.rowid = memories_fts.rowid
-                WHERE memories_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (fts, limit),
-            )
-            return [dict(r) for r in cur.fetchall()]
-        finally:
-            conn.close()
-    except Exception:
-        log.exception("voice memory search failed for query=%r", query[:60])
-        return []
-
-
-def _voice_memory_store_blocking(
-    *, content: str, category: str = "conversation",
-    namespace: str = "voice", importance: float = 0.5,
-    session_id: str | None = None,
-) -> bool:
-    """Insert a row into `memories`. FTS5 triggers maintain the index."""
-    import sqlite3
-    if not _VOICE_MEMORY_DB.exists():
-        log.warning("voice memory: db not found at %s", _VOICE_MEMORY_DB)
-        return False
-    if not content or not content.strip():
-        return False
-    now = datetime.now(ZoneInfo("UTC")).isoformat()
-    mem_id = str(uuid.uuid4())
-    base_key = f"voice_{category}_{now}_{mem_id[:8]}"
-    try:
-        conn = sqlite3.connect(str(_VOICE_MEMORY_DB), timeout=5)
-        try:
-            conn.execute(
-                """
-                INSERT INTO memories
-                  (id, key, content, category, namespace,
-                   importance, created_at, updated_at, session_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (mem_id, base_key, content.strip(), category, namespace,
-                 importance, now, now, session_id),
-            )
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-    except Exception:
-        log.exception("voice memory store failed (category=%s)", category)
-        return False
-
-
-def _voice_memory_person_fetch_blocking(
-    person_id: str, limit: int = _PERSON_MEMORY_MAX_FACTS,
-) -> list[dict]:
-    """Fetch durable per-person memory rows for `person_id` — a direct
-    `namespace='person:<id>'` lookup, *not* an FTS search. Ordered by
-    importance then recency. Read-only, WAL-friendly. Empty list on any
-    error, unknown person, or missing db.
-
-    Only the approved `person:<id>` namespace is read. The kid-safety
-    pending namespace (`person_pending:<id>`, written for minors) is
-    deliberately excluded so unreviewed facts never reach a prompt — see
-    the #53 review-before-write gate."""
-    import sqlite3
-    if not _VOICE_MEMORY_DB.exists():
-        log.warning("voice memory: db not found at %s", _VOICE_MEMORY_DB)
-        return []
-    pid = (person_id or "").strip().lower()
-    if not pid:
-        return []
-    try:
-        conn = sqlite3.connect(
-            f"file:{_VOICE_MEMORY_DB}?mode=ro", uri=True, timeout=2,
-        )
-        try:
-            conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                """
-                SELECT key, content, category, importance,
-                       created_at, updated_at
-                FROM memories
-                WHERE namespace = ?
-                ORDER BY importance DESC, updated_at DESC
-                LIMIT ?
-                """,
-                (f"person:{pid}", limit),
-            )
-            return [dict(r) for r in cur.fetchall()]
-        finally:
-            conn.close()
-    except Exception:
-        log.exception(
-            "voice memory person fetch failed for person_id=%r", pid,
-        )
-        return []
-
-
-def _build_person_memory_block(person_id: str | None) -> str:
-    """Render durable per-person memory for `person_id` as a
-    `[Person memory]` block for the talk-turn system prompt.
-
-    Performs a blocking SQLite read — **must** be called via
-    `asyncio.to_thread`, never directly on the event loop. Returns ""
-    when nothing is stored or `person_id` is None, so turns for unknown
-    / first-time speakers don't waste prompt tokens on an empty marker.
-    `_voice_preparer` injects the result after `[Speaking with]` and
-    before `[Current perception]` (#53)."""
-    if not person_id:
-        return ""
-    rows = _voice_memory_person_fetch_blocking(person_id)
-    if not rows:
-        return ""
-    facts: list[str] = []
-    for r in rows:
-        content = (r.get("content") or "").strip()
-        if not content:
-            continue
-        if len(content) > 160:
-            content = content[:159].rstrip() + "…"
-        facts.append(f"- {content}")
-    if not facts:
-        return ""
-    return "[Person memory]\n" + "\n".join(facts) + "\n"
 
 
 def _voice_memory_person_records_blocking() -> list[dict]:
     """List every per-person memory row — approved (`person:<id>`) and
-    pending review (`person_pending:<id>`). Powers the /ui/memory
-    dashboard (#53). Read-only. Empty list on error / missing db."""
+    pending review (`person_pending:<id>`). Powers the /ui/memory page (#53).
+    Read-only. Empty list on error / missing db."""
     import sqlite3
     if not _VOICE_MEMORY_DB.exists():
         return []
@@ -4090,11 +356,11 @@ def _voice_memory_person_records_blocking() -> list[dict]:
 
 
 def _voice_memory_approve_blocking(mem_id: str) -> bool:
-    """Promote a pending per-person memory row to approved —
-    `person_pending:<id>` → `person:<id>` (the #53 kid-safety review
-    action). Returns False if the row is missing or not in a pending
-    namespace, so a double-approve is a safe no-op."""
+    """Promote `person_pending:<id>` → `person:<id>`. Returns False if
+    the row is missing or not in a pending namespace (safe double-approve)."""
     import sqlite3
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     if not _VOICE_MEMORY_DB.exists() or not mem_id:
         return False
     prefix = "person_pending:"
@@ -4127,9 +393,8 @@ def _voice_memory_approve_blocking(mem_id: str) -> bool:
 
 
 def _voice_memory_delete_blocking(mem_id: str) -> bool:
-    """Delete a memory row by id — the /ui/memory redact action. The
-    FTS5 triggers drop the matching index row. Returns False if nothing
-    matched."""
+    """Delete a memory row by id — the /ui/memory redact action. FTS5
+    triggers drop the matching index row. False if nothing matched."""
     import sqlite3
     if not _VOICE_MEMORY_DB.exists() or not mem_id:
         return False
@@ -4148,1141 +413,198 @@ def _voice_memory_delete_blocking(mem_id: str) -> bool:
         return False
 
 
-async def _voice_tool_memory_lookup(args: dict, session_id: str) -> str:
-    query = (args.get("query") or "").strip()
-    if not query:
-        return "(empty query)"
-    rows = await asyncio.to_thread(_voice_memory_search_blocking, query, 5)
-    if not rows:
-        return "(no memories found)"
-    snippets = []
-    for r in rows[:3]:
-        c = (r.get("content") or "").strip()
-        if len(c) > 200:
-            c = c[:197] + "..."
-        snippets.append(c)
-    return " | ".join(snippets)
+# ---------------------------------------------------------------------------
+# Logging + FastAPI app
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dotty-bridge")
 
 
-async def _voice_tool_think_hard(args: dict, session_id: str) -> str:
-    """Direct call to llama-swap with model=qwen3.6:27b-think. Skips
-    ACP/ZeroClaw entirely — same motivation as Tier 1: avoid the agent
-    overhead on the voice critical path. Under the 2026-05-15 llama-swap
-    split this alias is in the `voice` matrix set and stays resident
-    alongside qwen3.5:4b, so most escalations are warm (no cold-load)."""
-    question = (args.get("question") or "").strip()
-    if not question:
-        return "(empty question)"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan slimmed to dashboard-only on the #111 rip.
 
-    def _post() -> str:
-        resp = requests.post(
-            _VOICE_THINKER_URL,
-            json={
-                "model": _VOICE_THINKER_MODEL,
-                "messages": [
-                    {"role": "system", "content":
-                        "Answer the user's question concisely in 1-2 sentences. Be precise."},
-                    {"role": "user", "content": question},
-                ],
-                "max_tokens": 200,
-                "temperature": 0.3,
-                "stream": False,
-                # qwen3 defaults to reasoning mode; without this the entire
-                # max_tokens budget gets eaten by `<think>...` tokens routed
-                # into reasoning_content and `content` comes back empty.
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-            timeout=_VOICE_THINKER_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return (data["choices"][0]["message"].get("content") or "").strip()[:500]
-
+    The voice / perception / VLM machinery that used to spin up here moved
+    to dotty-pi and dotty-behaviour in the #36 cutover; PR #109 then
+    containerized this file, and #111 ripped the dormant code paths so the
+    container doesn't double-fire consumers. Today the only startup work is
+    reconciling the live xiaozhi-server's Tier1Slim provider against the
+    persisted smart_mode bit so the bridge owns the source of truth.
+    """
     try:
-        return await asyncio.to_thread(_post)
-    except requests.exceptions.Timeout:
-        return "(I'm slow today, try again in a moment)"
+        await _reconcile_voice_model_at_startup()
     except Exception:
-        log.exception("voice think_hard failed")
-        return "(thinking failed)"
+        log.exception("startup voice-model reconcile raised — continuing anyway")
+    yield
 
 
-async def _voice_tool_take_photo(args: dict, session_id: str) -> str:
-    """v1: read the latest cached vision description (≤30s old). Future:
-    actively fire take_photo MCP and await a fresh description."""
-    best_desc = ""
-    best_age = 1e9
-    for cache in _vision_cache.values():
-        age = perf_counter() - cache.get("timestamp", 0)
-        if age < best_age and cache.get("description"):
-            best_age = age
-            best_desc = cache.get("description", "")
-    if best_desc and best_age <= 30:
-        return best_desc[:300]
-    return "(I can't see anything fresh right now)"
-
-
-_VOICE_PLAY_SONG_ASSET_BASE = os.environ.get(
-    "VOICE_PLAY_SONG_ASSET_BASE",
-    "/opt/xiaozhi-esp32-server/config/assets/songs",
-)
-# Module-level catalog cache so repeated "play X" turns don't refetch.
-_VOICE_PLAY_SONG_CACHE: dict[str, object] = {"files": [], "fetched_at": 0.0}
-_VOICE_PLAY_SONG_TTL_SEC = 60.0
-
-
-async def _voice_tool_play_song_catalog() -> list[str]:
-    """Return the song basenames mounted in xiaozhi-server's assets dir, with
-    a 60 s in-process cache. Empty list on failure."""
-    now = perf_counter()
-    fetched_at = float(_VOICE_PLAY_SONG_CACHE.get("fetched_at") or 0.0)
-    if now - fetched_at < _VOICE_PLAY_SONG_TTL_SEC:
-        return list(_VOICE_PLAY_SONG_CACHE.get("files") or [])
-    if not _XIAOZHI_HOST:
-        return []
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/songs"
-
-    def _fetch() -> list[str]:
-        try:
-            r = requests.get(url, timeout=2)
-            if r.status_code >= 400:
-                return []
-            data = r.json()
-            files = data.get("files") or []
-            return [f for f in files if isinstance(f, str)]
-        except Exception:
-            return []
-
-    files = await asyncio.to_thread(_fetch)
-    _VOICE_PLAY_SONG_CACHE["files"] = files
-    _VOICE_PLAY_SONG_CACHE["fetched_at"] = now
-    return list(files)
-
-
-def _voice_tool_play_song_match(query: str, files: list[str]) -> str | None:
-    """Resolve a free-form song name to a catalogue basename. Strategy:
-    case-insensitive exact-stem match first, then substring containment of
-    either side. Returns None when nothing reasonable matches."""
-    if not query or not files:
-        return None
-    q = query.strip().lower()
-    q_stem = os.path.splitext(q)[0].strip()
-    best: tuple[int, str] | None = None
-    for f in files:
-        stem = os.path.splitext(f)[0].lower()
-        if stem == q_stem:
-            return f
-        if q_stem and (q_stem in stem or stem in q_stem):
-            score = abs(len(stem) - len(q_stem))
-            if best is None or score < best[0]:
-                best = (score, f)
-    return best[1] if best else None
-
-
-async def _voice_tool_play_song(args: dict, session_id: str) -> str:
-    """Resolve `args["name"]` to a song file in the xiaozhi assets dir and
-    fire it via /xiaozhi/admin/play-asset. Returns a short status string for
-    the LLM to incorporate into its final answer."""
-    name = (args.get("name") or "").strip()
-    if not name:
-        return "(no song name given)"
-    if not _XIAOZHI_HOST:
-        log.warning("play_song: XIAOZHI_HOST not set")
-        return "(can't reach xiaozhi-server)"
-    files = await _voice_tool_play_song_catalog()
-    if not files:
-        return "(song catalogue is empty)"
-    match = _voice_tool_play_song_match(name, files)
-    if match is None:
-        sample = ", ".join(os.path.splitext(f)[0] for f in files[:5])
-        return f"(no match for '{name}'; have: {sample})"
-    asset = f"{_VOICE_PLAY_SONG_ASSET_BASE.rstrip('/')}/{match}"
-    url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/play-asset"
-
-    def _post() -> tuple[bool, str]:
-        try:
-            r = requests.post(url, json={"asset": asset}, timeout=3)
-            if r.status_code == 200:
-                return True, ""
-            return False, f"HTTP {r.status_code}: {r.text[:120]}"
-        except Exception as exc:
-            return False, str(exc)
-
-    ok, err = await asyncio.to_thread(_post)
-    if ok:
-        log.info("voice play_song dispatched: %s", match)
-        return f"playing {os.path.splitext(match)[0]}"
-    log.warning("voice play_song failed (%s): %s", match, err)
-    return f"(couldn't play {match}: {err})"
-
-
-async def _voice_tool_remember_person(args: dict, session_id: str) -> str:
-    """#53 escalate handler — store a durable fact about a named household
-    member. `args` carries the 4B's `name` + `fact`. The household-registry
-    id is the person's name lowercased (the `person:<id>` namespace
-    convention), so `name` is used directly as the person_id. Returns the
-    same confirmation strings as the pi-runtime `remember_person` tool so
-    the second model call can phrase the spoken reply consistently."""
-    name = (args.get("name") or args.get("person_id") or "").strip()
-    if not name:
-        return "(no person specified)"
-    if not (args.get("fact") or "").strip():
-        return "(empty fact)"
-    valid, stored, needs_review = await _person_memory_store(
-        name, args.get("fact") or "", session_id or None,
-    )
-    if not valid or not stored:
-        return "(remember failed)"
-    return (
-        "(saved — a grown-up will check that)" if needs_review
-        else f"(remembered about {name})"
-    )
-
-
-_VOICE_TOOLS = {
-    "memory_lookup": _voice_tool_memory_lookup,
-    "think_hard": _voice_tool_think_hard,
-    "take_photo": _voice_tool_take_photo,
-    "play_song": _voice_tool_play_song,
-    "remember_person": _voice_tool_remember_person,
-}
-
-
-class VoiceEscalateIn(BaseModel):
-    tool: str
-    args: dict = {}
-    session_id: str | None = None
-
-
-class VoiceMemoryLogIn(BaseModel):
-    user: str
-    assistant: str
-    session_id: str | None = None
-
-
-class VoiceRememberIn(BaseModel):
-    fact: str
-    session_id: str | None = None
-
-
-class VoiceRememberPersonIn(BaseModel):
-    person_id: str
-    fact: str
-    session_id: str | None = None
-
-
-@app.post("/api/voice/escalate")
-async def voice_escalate(payload: VoiceEscalateIn):
-    """Synchronous Tier 2 tool dispatcher. Called by tier1_slim when the 4B
-    emits a tool_call. Returns {"result": "..."} which the provider folds
-    back into its second (streaming) model call."""
-    tool = payload.tool or ""
-    handler = _VOICE_TOOLS.get(tool)
-    if not handler:
-        log.warning("voice escalate: unknown tool %r", tool)
-        return {"result": f"(unknown tool: {tool})"}
-    try:
-        result = await handler(payload.args or {}, payload.session_id or "")
-    except Exception:
-        log.exception("voice escalate %r failed", tool)
-        return {"result": f"({tool} failed)"}
-    return {"result": result}
-
-
-@app.post("/api/voice/memory_log", status_code=204)
-async def voice_memory_log(payload: VoiceMemoryLogIn):
-    """Fire-and-forget turn log. namespace=voice, category=conversation."""
-    user = (payload.user or "").strip()[:500]
-    assistant = (payload.assistant or "").strip()[:1000]
-    if not user and not assistant:
-        return
-    content = f"user: {user} | assistant: {assistant}"
-    _spawn(
-        asyncio.to_thread(
-            _voice_memory_store_blocking,
-            content=content, category="conversation", namespace="voice",
-            importance=0.3, session_id=payload.session_id,
-        ),
-        name="voice_memory_log",
-    )
-
-
-@app.post("/api/voice/remember", status_code=204)
-async def voice_remember(payload: VoiceRememberIn):
-    """Fire-and-forget fact store. namespace=voice, category=core (longer
-    retention than conversation)."""
-    fact = (payload.fact or "").strip()[:300]
-    if not fact:
-        return
-    _spawn(
-        asyncio.to_thread(
-            _voice_memory_store_blocking,
-            content=fact, category="core", namespace="voice",
-            importance=0.7, session_id=payload.session_id,
-        ),
-        name="voice_remember",
-    )
-
-
-# #53 kid-safety gate — TRANSITIONAL MIRROR.
-#
-# The canonical implementation lives in dotty-behaviour/routes/voice.py
-# (`_ADULT_RELATIONS` + `person_needs_review`). This copy exists only so
-# the legacy bridge.py write paths can gate in-process against the
-# in-process `_household_registry` — the two services are separate
-# Docker images on separate hosts and cannot share an import. It MUST
-# stay byte-identical to the dotty-behaviour version: edit there first,
-# then mirror here. Both copies disappear when the #36 rehoming retires
-# bridge.py + bridge/*.
-#
-# Relations that affirmatively mark a household member as an adult —
-# lets a registry entry with no `age:` still auto-commit. Everything
-# *not* in this set (a known minor, an ambiguous relation, an unknown
-# person) is routed to review by the kid-safety gate below.
-_ADULT_RELATIONS = frozenset({
-    "self", "owner", "parent", "mother", "father", "mum", "mom", "dad",
-    "partner", "spouse", "husband", "wife", "grandparent", "grandmother",
-    "grandfather", "aunt", "uncle", "sibling", "brother", "sister",
-})
-
-
-def _person_memory_needs_review(person_id: str) -> bool:
-    """#53 kid-safety gate: decide whether a declared fact about
-    `person_id` must go to the `person_pending:<id>` review queue
-    rather than straight into readable `person:<id>` memory.
-
-    Conservative by design — a fact auto-commits **only** when the
-    speaker is affirmatively an adult per the hand-authored household
-    registry (`age >= 18`, or an adult `relation`). A known minor, an
-    unknown person, or a registry entry too sparse to classify all
-    route to review. The safe failure mode is "a human looks first",
-    never "written about a minor unreviewed"."""
-    if _household_registry is None:
-        return True
-    try:
-        person = _household_registry.get(person_id)
-    except Exception:
-        log.debug("person memory gate: registry.get raised", exc_info=True)
-        return True
-    if person is None:
-        return True  # unknown person — cannot rule out a minor
-    if person.age is not None:
-        return person.age < 18
-    return (person.relation or "").strip().lower() not in _ADULT_RELATIONS
-
-
-async def _person_memory_store(
-    person_id: str, fact: str, session_id: str | None,
-) -> tuple[bool, bool, bool]:
-    """#53 gate + store for a declared per-person fact. Runs the kid-safety
-    gate (`_person_memory_needs_review`), writes to `person:<id>` or the
-    `person_pending:<id>` review queue accordingly, and returns
-    `(valid, stored, needs_review)`. `valid` is False when `person_id` or
-    `fact` is empty after normalisation. Shared by the
-    `/api/voice/remember_person` endpoint and the tier1slim escalate tool
-    handler so both write paths apply an identical gate decision."""
-    pid = (person_id or "").strip().lower()
-    fact = (fact or "").strip()[:300]
-    if not pid or not fact:
-        return False, False, False
-    needs_review = _person_memory_needs_review(pid)
-    namespace = (
-        f"person_pending:{pid}" if needs_review else f"person:{pid}"
-    )
-    stored = await asyncio.to_thread(
-        _voice_memory_store_blocking,
-        content=fact, category="core", namespace=namespace,
-        importance=0.7, session_id=session_id,
-    )
-    if stored:
+async def _reconcile_voice_model_at_startup() -> None:
+    """Bridge owns the source of truth for which model the voice provider
+    runs on (smart_mode state file → DEFAULT vs SMART). Push the desired
+    state at the live Tier1Slim provider so the next turn lands on the
+    right model. Best-effort: failures are logged, not fatal."""
+    if DOTTY_VOICE_PROVIDER != "tier1slim":
         log.info(
-            "person memory %s person=%s review=%s",
-            "queued" if needs_review else "stored", pid, needs_review,
+            "startup reconcile: DOTTY_VOICE_PROVIDER=%r ≠ 'tier1slim' — skipping",
+            DOTTY_VOICE_PROVIDER,
+        )
+        return
+    smart = _read_smart_mode()
+    t_model, t_url, t_api = _tier1slim_target_for_smart_mode(smart)
+    ok = await _dispatch_set_tier1slim_model(t_model, t_url, t_api)
+    if ok:
+        log.info(
+            "startup tier1slim reconcile: pushed model=%r (smart_mode=%s)",
+            t_model, smart,
         )
     else:
-        log.warning("person memory store failed person=%s", pid)
-    return True, stored, needs_review
+        log.warning(
+            "startup tier1slim reconcile failed: model=%r (smart_mode=%s) "
+            "— next dashboard flip will retry",
+            t_model, smart,
+        )
 
 
-@app.post("/api/voice/remember_person")
-async def voice_remember_person(payload: VoiceRememberPersonIn):
-    """Store a declared fact about a specific household member (#53).
+app = FastAPI(title="Dotty Bridge", lifespan=lifespan)
+app.add_middleware(CSRFMiddleware)
 
-    Unlike `/api/voice/remember` this is *not* fire-and-forget: the
-    kid-safety gate (`_person_memory_needs_review`) decides up front
-    whether the fact lands in readable `person:<id>` memory or the
-    `person_pending:<id>` review queue, and the caller is told which —
-    so the voice layer can phrase its confirmation ("I'll remember
-    that" vs "I'll check with a grown-up first"). Facts routed to
-    review are never loaded into a prompt until approved."""
-    valid, stored, needs_review = await _person_memory_store(
-        payload.person_id, payload.fact, payload.session_id,
-    )
-    if not valid:
-        return {"ok": False, "pending_review": False, "error": "empty"}
-    return {"ok": stored, "pending_review": needs_review}
-
-
-# ---------------------------------------------------------------------------
-# Scene synthesis — periodic "what's happening right now" memory writes
-# ---------------------------------------------------------------------------
-# Composes _vision_cache + _audio_cache + perception_state into one
-# sentence and appends to a daily NDJSON ring file. Phase C (ZeroClaw
-# ingestion of the NDJSON into FTS memory) is tracked separately. The
-# loop self-throttles to SCENE_SYNTHESIS_MIN_GAP_SEC so a burst of
-# face_recognized / state_changed events doesn't spam the file.
-
-_last_synthesis_ts: dict[str, float] = {}
-_SCENE_SYNTHESIS_TRIGGER_EVENTS = {
-    "face_recognized", "audio_captioned", "state_changed",
-}
-
-
-def _scene_synthesis_log_path() -> Path:
-    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-    return CONVO_LOG_DIR / f"scene-synthesis-{today}.ndjson"
-
-
-def _idle_perception_log_path() -> Path:
-    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-    return CONVO_LOG_DIR / f"perception-{today}.ndjson"
-
-
-def _write_idle_perception_record(device_id: str, description: str) -> None:
-    """Append one idle-perception record to the daily NDJSON ring file.
-    Same shape and mode (0600, no media) as scene-synthesis records,
-    with `type=perception` and `mode=idle` so future ingestion can
-    discriminate. ZeroClaw FTS ingestion of these files is a separate
-    routine (see Phase C scene-synthesis tracker)."""
-    record = {
-        "ts": datetime.now(LOCAL_TZ).isoformat(),
-        "device": device_id,
-        "type": "perception",
-        "mode": "idle",
-        "text": description,
-    }
-    path = _idle_perception_log_path()
+# Prometheus exposition. Mounted as an ASGI sub-app so it shares the
+# bridge's listener — keep that listener LAN-only (bind 0.0.0.0 on a
+# private network or 127.0.0.1 + a reverse proxy). NEVER expose /metrics
+# to the public internet; it leaks operational details about the host.
+if _METRICS_AVAILABLE and metrics_app is not None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        app.mount("/metrics", metrics_app())
+        log.info("Prometheus /metrics mounted")
     except Exception:
-        log.warning("idle perception ndjson write failed", exc_info=True)
+        log.exception("metrics mount failed — /metrics will be unavailable")
+
+try:
+    from bridge.dashboard import router as _dashboard_router, configure as _configure_dashboard
+    app.include_router(_dashboard_router)
+except Exception:
+    log.exception("dashboard mount failed — admin UI at /ui will be unavailable")
+    _configure_dashboard = None  # type: ignore[assignment]
+
+# Vendored JS/CSS + PWA icons for the dashboard. Served same-origin so we
+# can attach SRI to the <script>/<link> tags and drop the third-party
+# CDNs. Re-build the tailwind bundle with `npm run build:css` after editing
+# templates.
+try:
+    from fastapi.staticfiles import StaticFiles as _StaticFiles
+    _STATIC_DIR = Path(__file__).parent / "bridge" / "static"
+    if _STATIC_DIR.is_dir():
+        app.mount("/ui/static", _StaticFiles(directory=str(_STATIC_DIR)), name="ui-static")
+    else:
+        log.warning("dashboard static dir missing at %s — vendored assets will 404", _STATIC_DIR)
+except Exception:
+    log.exception("dashboard static mount failed — vendored assets at /ui/static will be unavailable")
 
 
-_IDLE_TOKEN_RE = re.compile(r"\w+")
+@app.get("/health")
+async def health() -> dict:
+    """Liveness probe. Reports just the service name + ok status — the
+    ACP/voice fields the pre-#36 health surface carried are gone with
+    the rest of the ZeroClaw path."""
+    return {"status": "ok", "service": "dotty-bridge"}
 
 
-def _is_notable_perception(
-    description: str, last_description: str | None,
-    *,
-    jaccard_threshold: float = IDLE_PHOTOGRAPHER_NOTABLE_JACCARD,
-) -> bool:
-    """True when `description` is worth saving to memory.
+# ---------------------------------------------------------------------------
+# Dashboard wiring
+# ---------------------------------------------------------------------------
+# bridge/dashboard.py is the actual /ui router; it pulls a small set of
+# callables out of bridge.py via configure() so it can flip kid/smart-mode
+# state files, push admin commands at xiaozhi-server, and read brain.db
+# for the memory panel. The perception / VLM / audio caches the pre-#36
+# dashboard read live in dotty-behaviour now — bridge.py exposes empty
+# stubs so the dashboard renders without errors (the perception card just
+# shows no data until the dashboard ports to dotty-behaviour).
 
-    Cheap, FTS-friendly notability check (memory is FTS-only — no
-    embeddings). Skips trivially short or "nothing changed" responses,
-    then computes token-set Jaccard similarity against the last saved
-    perception. Above the threshold = same scene = skip.
-    """
-    if not description or len(description) < 20:
-        return False
-    if "same as before" in description.lower():
-        return False
-    if not last_description:
-        return True
-    cur = set(t.lower() for t in _IDLE_TOKEN_RE.findall(description))
-    prev = set(t.lower() for t in _IDLE_TOKEN_RE.findall(last_description))
-    if not cur or not prev:
-        return True
-    union = cur | prev
-    if not union:
-        return True
-    jaccard = len(cur & prev) / len(union)
-    return jaccard < jaccard_threshold
+# Empty perception/vision/audio caches — dashboard reads these but the
+# writers (vision_explain, audio_explain, scene_synthesis_loop) all moved
+# to dotty-behaviour in #36. Kept as empty dicts so the perception card
+# templates don't 500 — they just render "no data".
+_vision_cache: dict[str, dict] = {}
+_audio_cache: dict[str, dict] = {}
+_scene_synthesis_cache: dict[str, dict] = {}
+_perception_state: dict[str, dict] = {}
 
 
-def _idle_photographer_pick_device() -> str | None:
-    """Single-device deployment helper — pick the device the
-    photographer should target. Mirrors `_pick_perception_device_id`
-    in dashboard.py; replicated here so the photographer doesn't
-    pull a dashboard import. Priority: most recent _vision_cache
-    entry, else first device in _perception_state."""
-    if _vision_cache:
-        try:
-            return max(
-                _vision_cache.items(),
-                key=lambda kv: kv[1].get("wall_ts", 0.0),
-            )[0]
-        except Exception:
-            pass
-    for did in _perception_state.keys():
-        if did and did != "unknown":
-            return did
+def _dashboard_perception_state_getter() -> dict:
+    """Empty perception snapshot — dotty-behaviour owns the live bus."""
+    return {}
+
+
+def _dashboard_perception_recent_getter(device_id: str, limit: int | None = None) -> list[dict]:
+    """Empty recent-events ring — dotty-behaviour owns the live bus."""
+    return []
+
+
+def _dashboard_state_getter() -> str:
+    """Return the current State of Dotty. Without a perception bus the
+    bridge can't know — fall through to 'idle' so the dashboard renders
+    safely. Real state is mirrored on dotty-behaviour."""
+    return "idle"
+
+
+def _dashboard_last_user_line_getter(device_id: str) -> dict | None:
+    """Empty — voice-turn transcripts now flow through dotty-pi."""
     return None
 
 
-# ---------------------------------------------------------------------------
-# Dream / dance NDJSON writers — see commit-5 plan for memory-tagging
-# rationale. Records are FTS-friendly text only; full dream text lives
-# alongside the summary so a future ZeroClaw routine can choose what
-# to ingest.
-# ---------------------------------------------------------------------------
-def _dreams_log_path() -> Path:
-    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-    return CONVO_LOG_DIR / f"dreams-{today}.ndjson"
+def _dashboard_sound_balance_series() -> list[float]:
+    """Empty sound-balance series — sound_event handling moved to
+    dotty-behaviour with the rest of the perception bus."""
+    return []
 
 
-def _dances_log_path() -> Path:
-    today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-    return CONVO_LOG_DIR / f"dances-{today}.ndjson"
+def _dashboard_vision_failures_last_hour() -> dict[str, int]:
+    """Empty vision-failure counters — VLM dispatch moved to dotty-behaviour."""
+    return {}
 
 
-def _write_jsonl_record(path: Path, record: dict) -> None:
-    """Shared NDJSON append helper. Mode 0600, ensure_ascii=False so
-    Unicode in narrative text round-trips cleanly. Best-effort —
-    swallows errors and warns rather than crashing the caller."""
+def _identity_display_name(identity: str) -> str | None:
+    """Resolve a household person_id to its display_name. With the
+    HouseholdRegistry write/read path moved to dotty-behaviour, this
+    always returns None on the bridge side — name resolution happens in
+    dotty-behaviour's consumers before the event lands in the dashboard
+    pipe (currently unwired)."""
+    return None
+
+
+# Stub SSE plumbing — kept so /ui/events still wakes the queue handler
+# (sends heartbeats) when the browser subscribes. No producer is wired in
+# bridge.py post-#111; convo turns are owned by dotty-pi now.
+_dashboard_event_listeners: list[asyncio.Queue] = []
+
+
+def _dashboard_subscribe_events() -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _dashboard_event_listeners.append(q)
+    return q
+
+
+def _dashboard_unsubscribe_events(q: asyncio.Queue) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except Exception:
-        log.warning("ndjson write failed: %s", path, exc_info=True)
-
-
-def _write_dream_record(
-    *,
-    dream_id: str, seed: str, full_text: str, summary: str | None,
-) -> None:
-    record = {
-        "ts": datetime.now(LOCAL_TZ).isoformat(),
-        "type": "dream",
-        "dream_id": dream_id,
-        "seed": seed,
-        "summary": summary or "",
-        "full_text": full_text,
-    }
-    _write_jsonl_record(_dreams_log_path(), record)
-
-
-def _write_dance_record(
-    *,
-    device_id: str, dance: str, reflection: str,
-) -> None:
-    record = {
-        "ts": datetime.now(LOCAL_TZ).isoformat(),
-        "type": "dance",
-        "device": device_id,
-        "dance": dance,
-        "reflection": reflection,
-    }
-    _write_jsonl_record(_dances_log_path(), record)
-
-
-def _split_dream_text(raw: str) -> tuple[str, str | None]:
-    """Split the dream LLM reply into `(full_text, summary)`. Looks for
-    a final line starting with `SUMMARY:` (case-insensitive). When
-    absent, returns the raw text and None — the dream still lands in
-    the daily NDJSON; downstream FTS just doesn't get the short-form
-    summary for that record.
-    """
-    if not raw:
-        return "", None
-    text = raw.rstrip()
-    lines = text.splitlines()
-    for i in range(len(lines) - 1, -1, -1):
-        line = lines[i].strip()
-        if line.lower().startswith("summary:"):
-            summary = line.split(":", 1)[1].strip()
-            full_text = "\n".join(lines[:i]).rstrip()
-            return full_text, (summary or None)
-    return text, None
-
-
-# Dream prompt — sent to NARRATIVE_MODEL with no kid-mode wrap. The
-# `seed` slot is filled with one of DREAM_INSPIRATIONS.
-DREAM_SYSTEM_PROMPT = (
-    "You are Dotty, a small family robot, asleep. You are dreaming. "
-    "Write rich, multi-paragraph robot dreams in first person, present "
-    "tense — perception is strange, time bends, identity is fluid. "
-    "Draw on the seed's atmosphere without retelling it. End with a "
-    "half-thought, not a wrap. After the dream, on a new line starting "
-    "with 'SUMMARY:', give a 1–2 sentence summary suitable for memory."
-)
-DREAM_USER_PROMPT_TEMPLATE = (
-    "Tonight's seed: {seed}\n"
-    "\n"
-    "Write a dream of 4–7 paragraphs as Dotty would dream it.\n"
-)
-
-# Dance reflection prompt — short introspective monologue, NOT spoken.
-DANCE_SYSTEM_PROMPT = (
-    "You are Dotty, a small family robot, reflecting privately on a "
-    "dance you just finished. Write 2–3 sentences in first person, "
-    "present tense, internal monologue (not spoken). Capture the joy, "
-    "the rhythm, the silliness. Keep it under 300 characters."
-)
-DANCE_USER_PROMPT_TEMPLATE = (
-    "You just finished dancing to {dance}. How did it feel?"
-)
-
-
-async def _perception_sleep_dreamer() -> None:
-    """Background task: when the device transitions to sleep, schedule
-    DREAM_COUNT_PER_NIGHT dreams across DREAM_WINDOW_SECONDS at
-    evenly-spaced fractions (defaults: 3 dreams at 25/50/75% of an
-    8h window). Cancels pending dreams if the device leaves sleep
-    early (head-pet wake, manual wake, talk).
-
-    Dreams are independent: each one calls the narrative LLM with a
-    random seed, parses out a SUMMARY line, and appends a record to
-    the daily dreams NDJSON. Failures are isolated — one dream's
-    network blip doesn't kill the schedule.
-    """
-    log.info(
-        "perception sleep dreamer started "
-        "(window=%.0fs count=%d model=%s)",
-        DREAM_WINDOW_SECONDS, DREAM_COUNT_PER_NIGHT, NARRATIVE_MODEL,
-    )
-    q = _perception_subscribe()
-    pending: dict[str, list[asyncio.Task]] = {}
-
-    def _cancel_pending(device_id: str) -> None:
-        tasks = pending.pop(device_id, [])
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-
-    async def _fire_one(device_id: str, seed: str) -> None:
-        dream_id = uuid.uuid4().hex
-        user_prompt = DREAM_USER_PROMPT_TEMPLATE.format(seed=seed)
-        log.info(
-            "dream firing: device=%s seed=%s id=%s",
-            device_id, seed, dream_id,
-        )
-        text = await asyncio.to_thread(
-            _call_narrative_llm,
-            user_prompt,
-            system_prompt=DREAM_SYSTEM_PROMPT,
-            max_tokens=1200,
-        )
-        if not text:
-            log.warning("dream skipped (LLM returned no text): id=%s", dream_id)
-            return
-        full_text, summary = _split_dream_text(text)
-        _write_dream_record(
-            dream_id=dream_id, seed=seed,
-            full_text=full_text, summary=summary,
-        )
-        log.info(
-            "dream saved: id=%s seed=%s chars=%d summary=%s",
-            dream_id, seed, len(full_text),
-            (summary or "")[:80],
-        )
-
-    def _schedule(device_id: str) -> None:
-        _cancel_pending(device_id)
-        if DREAM_COUNT_PER_NIGHT <= 0:
-            return
-        tasks: list[asyncio.Task] = []
-        # Even fractions: 1/(N+1), 2/(N+1), ..., N/(N+1) of the window.
-        # For N=3, this gives 25/50/75% — the canonical schedule.
-        for i in range(1, DREAM_COUNT_PER_NIGHT + 1):
-            delay = DREAM_WINDOW_SECONDS * (i / (DREAM_COUNT_PER_NIGHT + 1))
-            seed = random.choice(DREAM_INSPIRATIONS)
-
-            async def _delayed_fire(d: float, did: str, s: str) -> None:
-                await asyncio.sleep(d)
-                try:
-                    await _fire_one(did, s)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("dream fire crashed: device=%s seed=%s", did, s)
-
-            tasks.append(
-                asyncio.create_task(_delayed_fire(delay, device_id, seed))
-            )
-        pending[device_id] = tasks
-        log.info(
-            "dreams scheduled: device=%s count=%d delays=%s",
-            device_id, len(tasks),
-            [f"{DREAM_WINDOW_SECONDS * (i / (DREAM_COUNT_PER_NIGHT + 1)):.0f}s"
-             for i in range(1, DREAM_COUNT_PER_NIGHT + 1)],
-        )
-
-    try:
-        while True:
-            event = await q.get()
-            name = event.get("name") or ""
-            if name != "state_changed":
-                continue
-            device_id = event.get("device_id") or ""
-            if not device_id:
-                continue
-            new_state = (event.get("data", {}).get("state") or "").strip().lower()
-            if new_state == "sleep":
-                _schedule(device_id)
-            else:
-                # Any non-sleep state cancels pending dreams. The next
-                # transition back to sleep schedules a fresh batch.
-                if device_id in pending:
-                    log.info(
-                        "dreams cancelled: device=%s reason=state=%s",
-                        device_id, new_state,
-                    )
-                    _cancel_pending(device_id)
-    except asyncio.CancelledError:
-        log.info("perception sleep dreamer cancelled")
-        for did in list(pending.keys()):
-            _cancel_pending(did)
-        raise
-    except Exception:
-        log.exception("perception sleep dreamer crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-async def _perception_dance_reflector() -> None:
-    """Background task: on `dance_ended` events, fire the narrative LLM
-    for a short reflection on the dance and append to the daily dances
-    NDJSON. Silent — no audio, no LED change, no state mutation. Each
-    reflection is independent; failures are logged and skipped.
-    """
-    log.info(
-        "perception dance reflector started (model=%s)", NARRATIVE_MODEL,
-    )
-    q = _perception_subscribe()
-    try:
-        while True:
-            event = await q.get()
-            if event.get("name") != "dance_ended":
-                continue
-            device_id = event.get("device_id") or ""
-            if not device_id:
-                continue
-            data = event.get("data") or {}
-            # `data.dance` may be empty if the firmware emitted a bare
-            # dance_ended (older firmware); fall back to a generic name.
-            dance = (data.get("dance") or "the dance").strip() or "the dance"
-            user_prompt = DANCE_USER_PROMPT_TEMPLATE.format(dance=dance)
-
-            async def _fire(did: str, dn: str, up: str) -> None:
-                text = await asyncio.to_thread(
-                    _call_narrative_llm,
-                    up,
-                    system_prompt=DANCE_SYSTEM_PROMPT,
-                    max_tokens=200,
-                    temperature=0.85,
-                )
-                if not text:
-                    log.warning(
-                        "dance reflection skipped (no LLM text): device=%s dance=%s",
-                        did, dn,
-                    )
-                    return
-                _write_dance_record(
-                    device_id=did, dance=dn, reflection=text,
-                )
-                log.info(
-                    "dance reflection saved: device=%s dance=%s chars=%d",
-                    did, dn, len(text),
-                )
-
-            _spawn(
-                _fire(device_id, dance, user_prompt),
-                name="dance_reflector_fire",
-            )
-    except asyncio.CancelledError:
-        log.info("perception dance reflector cancelled")
-        raise
-    except Exception:
-        log.exception("perception dance reflector crashed")
-    finally:
-        _perception_unsubscribe(q)
-
-
-async def _perception_idle_photographer() -> None:
-    """Background task: while idle, fire `take_photo` every 3–5 min
-    (jittered) and write notable descriptions to the idle-perception
-    NDJSON. No servo motion, no LED change, no audio cue — silent
-    capture. Skips when state != idle, when listening, when a face
-    is present (room-view path handles those), and when the dispatch
-    relay returns False (xiaozhi-server admin route missing).
-
-    Skips on no-device-known and on dispatch failures rather than
-    crashing — a missed cycle just means the next 3–5 min retries.
-    """
-    log.info(
-        "perception idle photographer started "
-        "(sleep=%.0f–%.0fs jaccard=%.2f wait=%.0fs)",
-        IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC,
-        IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC,
-        IDLE_PHOTOGRAPHER_NOTABLE_JACCARD,
-        IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC,
-    )
-    try:
-        from bridge.security_watch import dispatch_take_photo
-    except Exception:
-        log.exception("idle photographer: dispatch_take_photo import failed; aborting")
-        return
-    try:
-        while True:
-            sleep_s = random.uniform(
-                IDLE_PHOTOGRAPHER_SLEEP_MIN_SEC,
-                IDLE_PHOTOGRAPHER_SLEEP_MAX_SEC,
-            )
-            await asyncio.sleep(sleep_s)
-            device_id = _idle_photographer_pick_device()
-            if not device_id:
-                continue
-            pstate = _perception_state.get(device_id, {}) or {}
-            current_state = (pstate.get("current_state") or "idle").lower()
-            if current_state != "idle":
-                continue
-            if pstate.get("listening"):
-                continue
-            if pstate.get("face_present"):
-                continue
-            pre_ts = (
-                _vision_cache.get(device_id, {}).get("wall_ts") or 0.0
-            )
-            ok = await dispatch_take_photo(
-                device_id, question=IDLE_WANDER_PROMPT,
-            )
-            if not ok:
-                # Already logged once by dispatch_take_photo; don't
-                # spam the journal on repeated 404s.
-                continue
-            await asyncio.sleep(IDLE_PHOTOGRAPHER_RESULT_WAIT_SEC)
-            entry = _vision_cache.get(device_id) or {}
-            new_ts = entry.get("wall_ts") or 0.0
-            description = (entry.get("description") or "").strip()
-            if not description or new_ts <= pre_ts:
-                log.info(
-                    "idle photographer: device=%s no fresh description "
-                    "(new_ts=%.0f pre_ts=%.0f)",
-                    device_id, new_ts, pre_ts,
-                )
-                continue
-            last_text = pstate.get("last_idle_perception_text")
-            if not _is_notable_perception(description, last_text):
-                log.info(
-                    "idle photographer: device=%s skipped (not notable, "
-                    "len=%d)", device_id, len(description),
-                )
-                continue
-            pstate["last_idle_perception_text"] = description
-            pstate["last_idle_perception_t"] = time.time()
-            _perception_state[device_id] = pstate
-            _write_idle_perception_record(device_id, description)
-            log.info(
-                "idle photographer: device=%s saved perception (%d chars)",
-                device_id, len(description),
-            )
-    except asyncio.CancelledError:
-        log.info("perception idle photographer cancelled")
-        raise
-    except Exception:
-        log.exception("perception idle photographer crashed")
-
-
-def _compose_scene_synthesis(device_id: str) -> dict | None:
-    """Build the synthesis record dict for `device_id`, or None if there's
-    nothing fresh enough to be worth writing.
-
-    Pulls only from in-memory caches — _vision_cache / _audio_cache /
-    _perception_state. Caller decides whether to actually emit (cadence,
-    min-gap guard)."""
-    now_wall = time.time()
-    now_perf = perf_counter()
-    pstate = _perception_state.get(device_id) or {}
-
-    vision_entry = _vision_cache.get(device_id) or {}
-    has_vision = bool(
-        vision_entry
-        and now_perf - vision_entry.get("timestamp", 0.0)
-        <= VISION_CACHE_TTL_SEC
-    )
-    vision_desc = (
-        (vision_entry.get("description") or "").strip() if has_vision else ""
-    )
-
-    audio_entry = _audio_cache.get(device_id) or {}
-    has_audio = bool(
-        audio_entry
-        and now_perf - audio_entry.get("timestamp", 0.0)
-        <= AUDIO_CACHE_TTL_SEC
-    )
-    audio_desc = (
-        (audio_entry.get("description") or "").strip() if has_audio else ""
-    )
-
-    # Don't emit a record that has literally nothing in it. Face presence
-    # alone is too thin a signal to clutter the log.
-    if not has_vision and not has_audio:
-        return None
-
-    # Use the TTL-aware accessor so a flickering detector doesn't collapse
-    # `face_id` to None within ~1 s of identification.
-    face_id = get_fresh_face_id(device_id)
-    face_present = bool(pstate.get("face_present"))
-    if face_id:
-        face_phrase = f"{face_id} is in the room."
-    elif face_present:
-        face_phrase = "Someone is in the room."
-    else:
-        face_phrase = "No one is detected."
-
-    state = pstate.get("current_state") or "idle"
-
-    parts: list[str] = []
-    ts_label = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-    parts.append(f"{ts_label} — {face_phrase}")
-    if vision_desc:
-        parts.append(f"Dotty sees {vision_desc.rstrip('.')}.")
-    if audio_desc:
-        parts.append(f"Heard: {audio_desc.rstrip('.')}.")
-    parts.append(f"State: {state}.")
-    text = " ".join(parts)
-
-    return {
-        "ts": datetime.now(LOCAL_TZ).isoformat(),
-        "ts_wall": now_wall,
-        "type": "scene_synthesis",
-        "device": device_id,
-        "text": text,
-        "face_id": face_id,
-        "state": state,
-        "has_vision": has_vision,
-        "has_audio_caption": has_audio,
-    }
-
-
-def _write_scene_synthesis_ndjson(record: dict) -> None:
-    """Append one record to the daily NDJSON ring file. Mirrors the
-    write_security_record pattern (mode 0600, JSON line, no media)."""
-    path = _scene_synthesis_log_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Strip the wall ts before serialising — it's only used in-process
-        # for cache TTL bookkeeping. The isoformat `ts` is the canonical
-        # timestamp on disk.
-        on_disk = {k: v for k, v in record.items() if k != "ts_wall"}
-        line = json.dumps(on_disk, ensure_ascii=False) + "\n"
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(line)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass  # best-effort; first write sets the mode
-    except Exception:
-        log.warning("scene synthesis ndjson write failed", exc_info=True)
-
-
-def _maybe_emit_scene_synthesis(device_id: str, *, reason: str) -> None:
-    """Compose, throttle-check, cache, and write one synthesis record."""
-    record = _compose_scene_synthesis(device_id)
-    if record is None:
-        return
-    now_wall = record["ts_wall"]
-    last = _last_synthesis_ts.get(device_id, 0.0)
-    if now_wall - last < SCENE_SYNTHESIS_MIN_GAP_SEC:
-        return
-    _last_synthesis_ts[device_id] = now_wall
-    _scene_synthesis_cache[device_id] = {
-        "text": record["text"],
-        "ts_wall": now_wall,
-        "face_id": record["face_id"],
-        "state": record["state"],
-    }
-    _write_scene_synthesis_ndjson(record)
-    log.info(
-        "scene_synthesis device=%s reason=%s text=%s",
-        device_id, reason, record["text"][:160],
-    )
-    # Broadcast a synthetic event so the dashboard's SSE listener can
-    # nudge the Perception card to redraw immediately instead of
-    # waiting for the next 10 s polling tick. Same `dotty-refresh`
-    # plumbing the vision/face events use.
-    try:
-        _perception_broadcast({
-            "name": "scene_synthesised",
-            "device_id": device_id,
-            "ts": now_wall,
-            "data": {
-                "reason": reason,
-                "preview": record["text"][:80],
-            },
-        })
-    except Exception:
-        log.warning("scene synthesis broadcast failed", exc_info=True)
-
-
-async def _scene_synthesis_loop() -> None:
-    """Single task that drives both the time-based ticker and the
-    perception-event triggers. Subscribes to the perception bus and
-    races queue.get() against an interval timeout — whichever fires
-    first decides the next emit attempt. Failures never propagate."""
-    queue = _perception_subscribe()
-    log.info(
-        "perception scene-synthesis loop started "
-        "(interval=%.0fs min_gap=%.0fs)",
-        SCENE_SYNTHESIS_INTERVAL_SEC, SCENE_SYNTHESIS_MIN_GAP_SEC,
-    )
-    try:
-        while True:
-            reason = "tick"
-            try:
-                ev = await asyncio.wait_for(
-                    queue.get(), timeout=SCENE_SYNTHESIS_INTERVAL_SEC,
-                )
-            except asyncio.TimeoutError:
-                ev = None
-            if ev is not None:
-                name = ev.get("name") or ""
-                if name not in _SCENE_SYNTHESIS_TRIGGER_EVENTS:
-                    continue
-                if name == "state_changed":
-                    new_state = (ev.get("data") or {}).get("state")
-                    if new_state not in SCENE_SYNTHESIS_TRIGGER_STATES:
-                        continue
-                reason = name
-                device_ids = [ev.get("device_id")] if ev.get("device_id") else []
-            else:
-                device_ids = list(_perception_state.keys())
-            for did in device_ids:
-                if not did:
-                    continue
-                try:
-                    _maybe_emit_scene_synthesis(did, reason=reason)
-                except Exception:
-                    log.warning(
-                        "scene synthesis emit failed device=%s", did,
-                        exc_info=True,
-                    )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.exception("scene synthesis loop crashed — exiting cleanly")
-    finally:
-        _perception_unsubscribe(queue)
-
-
-@app.post("/api/message", response_model=MessageOut)
-async def message(payload: MessageIn) -> MessageOut:
-    session_id = payload.session_id or str(uuid.uuid4())
-    log.info("msg channel=%s session=%s len=%d",
-             payload.channel, session_id, len(payload.content))
-    _record_last_user_line(
-        (payload.metadata or {}).get("device_id"), payload.content,
-    )
-    await _refresh_caches()
-    speaker = _resolve_speaker_for_request(payload)
-    person_memory_block = None
-    if speaker is not None and speaker.person_id:
-        log.info(
-            "speaker channel=%s person=%s addressee=%s conf=%.2f signals=%s",
-            payload.channel, speaker.person_id, speaker.addressee,
-            speaker.confidence,
-            ",".join(v.signal for v in speaker.votes) or "-",
-        )
-        person_memory_block = await asyncio.to_thread(
-            _build_person_memory_block, speaker.person_id,
-        )
-    t0 = perf_counter()
-    error_msg = None
-    try:
-        raw = await asyncio.wait_for(
-            acp.prompt(
-                payload.content,
-                xiaozhi_sid=payload.session_id,
-                prepare=_voice_preparer(
-                    payload.channel, speaker,
-                    room_description=(payload.metadata or {}).get(
-                        "room_description"),
-                    device_id=(payload.metadata or {}).get("device_id"),
-                    person_memory_block=person_memory_block,
-                ),
-            ),
-            timeout=REQUEST_TIMEOUT_SEC,
-        )
-        raw = clean_for_tts(ensure_emoji_prefix(content_filter(raw) or raw))
-        raw = strip_extra_emojis(raw)
-        answer = truncate_sentences(raw)
-    except asyncio.TimeoutError:
-        log.warning("ACP timeout")
-        answer = f"{FALLBACK_EMOJI} I'm thinking too slowly right now, try again."
-        error_msg = "timeout"
-    except FileNotFoundError:
-        log.exception("zeroclaw binary missing")
-        answer = f"{FALLBACK_EMOJI} My AI brain is offline."
-        error_msg = "binary_missing"
-    except Exception:
-        log.exception("ACP invocation failed")
-        answer = f"{FALLBACK_EMOJI} Something went wrong, please try again."
-        error_msg = "exception"
-    elapsed_s = perf_counter() - t0
-    if _METRICS_AVAILABLE:
-        _safe_metric(
-            dotty_request_duration_seconds.labels(endpoint="message").observe,
-            elapsed_s,
-        )
-        if error_msg:
-            _safe_metric(
-                dotty_request_errors_total.labels(
-                    endpoint="message", kind=error_msg,
-                ).inc,
-            )
-        else:
-            # Non-streaming first-audio = full response latency from the
-            # bridge's POV (xiaozhi-server pipelines TTS once it gets the
-            # full reply). Streaming endpoint records a tighter value at
-            # first chunk emit.
-            _safe_metric(record_first_audio, elapsed_s)
-    _convo_log.log_turn(
-        channel=payload.channel or "",
-        session_id=session_id,
-        request_text=payload.content,
-        response_text=answer,
-        latency_ms=elapsed_s * 1000.0,
-        error=error_msg,
-        latency_phases=dict(acp._last_phases) if acp._last_phases else None,
-    )
-    return MessageOut(response=answer, session_id=session_id)
+        _dashboard_event_listeners.remove(q)
+    except ValueError:
+        pass
 
 
 if _configure_dashboard is not None:
-    async def _dashboard_send_message(*, text: str, channel: str = "dotty") -> dict:
-        out = await message(MessageIn(content=text, channel=channel))
-        return {"response": out.response, "session_id": out.session_id}
-
     async def _dashboard_set_kid_mode(enabled: bool) -> dict:
-        # kid_mode is guardrails only (content sandwich, denied tools, persona)
-        # — it does NOT pick the model. smart_mode owns model selection.
-        # Hot-reloaded in-process via `_apply_kid_mode`, so no daemon restart
-        # is needed; the LED pip flip is pushed live by `_dispatch_set_toggle`.
-        # Bridge-side flip (file + globals) runs unconditionally so guardrails
-        # take effect immediately. If the firmware MCP dispatch fails, return
-        # ok=False with an error so the dashboard surfaces the desync —
-        # otherwise the LED + on-device toggle pip would silently stay stale.
+        """Flip kid_mode bit + push the LED pip to the firmware. Guardrails
+        used to live in the bridge's voice path; post-#36 kid_mode is just
+        a stored bit + LED — the actual content-filtering lives in
+        custom-providers/textUtils.py and the persona prompts."""
         _write_kid_mode(enabled)
         _apply_kid_mode(enabled)
         ok = await _dispatch_set_toggle("", "kid_mode", enabled)
         if not ok:
             return {
                 "ok": False,
-                "error": "firmware did not acknowledge — LED + on-device toggle stale; bridge guardrails are flipped",
+                "error": "firmware did not acknowledge — LED + on-device toggle stale; bridge state is flipped",
             }
         return {"ok": True}
 
@@ -5290,11 +612,11 @@ if _configure_dashboard is not None:
         """Fire-and-forget POST to xiaozhi-server's admin abort route."""
         if not _XIAOZHI_HOST:
             return {"ok": False, "error": "XIAOZHI_HOST not set"}
-
         url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/abort"
         payload: dict = {}
         if device_id:
             payload["device_id"] = device_id
+
         def _post() -> dict:
             try:
                 r = requests.post(url, json=payload, timeout=3)
@@ -5305,19 +627,20 @@ if _configure_dashboard is not None:
                 return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
+
         return await asyncio.to_thread(_post)
 
     async def _dashboard_inject_to_device(*, text: str, device_id: str = "") -> dict:
-        """Fire-and-forget POST to xiaozhi-server's admin route so the
-        named (or first-available) device runs the text through its
-        normal post-ASR pipeline — intent detection, MCP tools, TTS."""
+        """POST to xiaozhi-server's /admin/inject-text so the named (or
+        first-available) device runs the text through its post-ASR
+        pipeline — intent detection, MCP tools, TTS."""
         if not _XIAOZHI_HOST:
             return {"ok": False, "error": "XIAOZHI_HOST not set"}
-
         url = f"http://{_XIAOZHI_HOST}:{_XIAOZHI_HTTP_PORT}/xiaozhi/admin/inject-text"
         payload = {"text": text}
         if device_id:
             payload["device_id"] = device_id
+
         def _post() -> dict:
             try:
                 r = requests.post(url, json=payload, timeout=3)
@@ -5328,46 +651,17 @@ if _configure_dashboard is not None:
                 return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
+
         return await asyncio.to_thread(_post)
-
-    def _dashboard_state_getter() -> str:
-        """Return the current State of the (first connected) device, or 'idle'.
-        Falls back to 'idle' before any state_changed event has been seen."""
-        for st in _perception_state.values():
-            s = st.get("current_state")
-            if s:
-                return s
-        return "idle"
-
-    def _dashboard_perception_state_getter() -> dict:
-        """Snapshot of per-device perception state with sensor_stale +
-        sensor_age_s annotations — same shape as /api/perception/state but
-        called in-process so the dashboard avoids an HTTP round-trip on
-        every status-strip refresh. Stale threshold is the bridge's
-        _PERCEPTION_STALE_THRESHOLD_S; sensors going quiet past that
-        window flips the Dotty header dot to amber even when voice is
-        otherwise live."""
-        now = time.time()
-        out: dict[str, dict] = {}
-        for did, raw in _perception_state.items():
-            entry = dict(raw)
-            last_t = entry.get("last_event_t")
-            age = float("inf") if last_t is None else max(0.0, now - last_t)
-            entry["sensor_age_s"] = age
-            entry["sensor_stale"] = age > _PERCEPTION_STALE_THRESHOLD_S
-            out[did] = entry
-        return out
 
     async def _dashboard_set_state(state: str) -> dict:
         ok = await _dispatch_set_state("", state)
         return {"ok": ok}
 
     async def _dashboard_set_smart_mode(enabled: bool) -> dict:
-        # smart_mode owns voice-daemon model selection. ON → SMART_MODEL,
-        # OFF → DEFAULT_MODEL. Under DOTTY_VOICE_PROVIDER=tier1slim, the swap
-        # is a sub-second hot-mutation of the live Tier1Slim provider via
-        # the xiaozhi admin endpoint (no restart). Otherwise we fall through
-        # to the legacy ZeroClaw config.toml rewrite + daemon restart.
+        """Flip smart_mode + push the LED pip + hot-swap the live
+        Tier1Slim provider's model via /xiaozhi/admin/set-tier1slim-model.
+        The pre-#36 ZeroClaw config.toml-rewrite path is gone."""
         _write_smart_mode(enabled)
         dispatch_ok = await _dispatch_set_toggle("", "smart_mode", enabled)
         swap_err: str | None = None
@@ -5377,16 +671,11 @@ if _configure_dashboard is not None:
             if not ok:
                 swap_err = f"tier1slim hot-swap to {t_model!r} failed"
         else:
-            target_model = SMART_MODEL if enabled else DEFAULT_MODEL
-            try:
-                _apply_model_swap("voice", target_model)
-                _admin_schedule_restart(_ADMIN_DAEMON_CFG["voice"][1])
-            except Exception as exc:
-                logging.getLogger("zeroclaw-bridge").exception(
-                    "smart_mode flip succeeded but model swap/restart to %r failed",
-                    target_model,
-                )
-                swap_err = f"model swap/restart to {target_model!r} failed: {exc}"
+            log.warning(
+                "smart_mode flip: DOTTY_VOICE_PROVIDER=%r is not 'tier1slim' — "
+                "no model swap performed",
+                DOTTY_VOICE_PROVIDER,
+            )
         errors: list[str] = []
         if not dispatch_ok:
             errors.append("firmware did not acknowledge set_toggle (LED pip stale)")
@@ -5395,20 +684,6 @@ if _configure_dashboard is not None:
         if errors:
             return {"ok": False, "error": "; ".join(errors)}
         return {"ok": True}
-
-    def _identity_display_name(identity: str) -> str | None:
-        """Resolve a household person_id to its display_name, or None if the
-        registry isn't loaded / the id isn't in the roster. Used by the
-        dashboard's Perception card to label an identified face."""
-        if not identity or _household_registry is None:
-            return None
-        try:
-            person = _household_registry.get(identity)
-        except Exception:
-            return None
-        if person is None:
-            return None
-        return getattr(person, "display_name", None) or None
 
     async def _dashboard_memory_records() -> list[dict]:
         """All per-person memory rows (approved + pending) for /ui/memory."""
@@ -5423,7 +698,10 @@ if _configure_dashboard is not None:
         return {"ok": ok}
 
     _configure_dashboard(
-        send_message=_dashboard_send_message,
+        # send_message is unused by dashboard.py post-#111 (voice turns
+        # now go through dotty-pi); kept None so configure() stays
+        # idempotent if the dashboard module gains a reference later.
+        send_message=None,
         vision_cache=_vision_cache,
         audio_cache=_audio_cache,
         scene_synthesis_cache=_scene_synthesis_cache,
@@ -5438,71 +716,39 @@ if _configure_dashboard is not None:
         subscribe_events=_dashboard_subscribe_events,
         unsubscribe_events=_dashboard_unsubscribe_events,
         perception_state_getter=_dashboard_perception_state_getter,
-        perception_recent_getter=get_recent_perception,
+        perception_recent_getter=_dashboard_perception_recent_getter,
         memory_records_getter=_dashboard_memory_records,
         memory_approve=_dashboard_memory_approve,
         memory_redact=_dashboard_memory_redact,
         identity_display_name=_identity_display_name,
-        last_user_line_getter=_get_last_user_line,
-        sound_balance_getter=_sound_balance_series,
-        vision_failures_getter=_vision_failures_last_hour,
+        last_user_line_getter=_dashboard_last_user_line_getter,
+        sound_balance_getter=_dashboard_sound_balance_series,
+        vision_failures_getter=_dashboard_vision_failures_last_hour,
     )
 
 
 # ---------------------------------------------------------------------------
-# /admin/* — runtime configuration mutations. Localhost-only so only same-host
-# callers can hit them. Useful when an external agent (e.g. a separate ZeroClaw
-# daemon or operator script) needs to flip kid-mode, swap models, edit a
-# persona file, or amend the MCP tool allowlist without an SSH session.
-#
-# Paths and systemd unit names are env-configurable (defaults match the
-# documented ZeroClaw host layout):
-#   ZEROCLAW_VOICE_CFG       - voice daemon config.toml
-#   ZEROCLAW_VOICE_UNIT      - voice daemon's systemd unit (the bridge)
-#   ZEROCLAW_DISCORD_CFG     - optional secondary daemon config.toml
-#   ZEROCLAW_DISCORD_UNIT    - optional secondary daemon's systemd unit
-#   ZEROCLAW_WORKSPACE       - workspace dir holding SOUL.md / IDENTITY.md / ...
+# /admin/* — localhost-only runtime configuration mutations
 # ---------------------------------------------------------------------------
-from fastapi import APIRouter, Depends, HTTPException
+# Editable from same-host operator scripts. The dashboard uses the
+# bridge.dashboard /ui/actions/* routes (which call into _dashboard_*
+# above), not these — these are the back-channel for ad-hoc CLI flips.
+# Paths/units are env-configurable; defaults are placeholders since the
+# zeroclaw daemon they used to point at is gone.
 
 _ADMIN_ALLOWED_PERSONA_FILES = {
     "SOUL.md", "IDENTITY.md", "USER.md", "AGENTS.md",
     "TOOLS.md", "BOOTSTRAP.md", "HEARTBEAT.md", "MEMORY.md",
 }
 _ADMIN_WORKSPACE_DIR = Path(
-    os.environ.get("ZEROCLAW_WORKSPACE", "/root/.zeroclaw/workspace")
+    os.environ.get("DOTTY_PERSONA_DIR", os.environ.get("ZEROCLAW_WORKSPACE", "/root/.zeroclaw/workspace"))
 )
-_ADMIN_DAEMON_CFG = {
-    "voice": (
-        os.environ.get("ZEROCLAW_VOICE_CFG", "/root/.zeroclaw/config.toml"),
-        os.environ.get("ZEROCLAW_VOICE_UNIT", "zeroclaw-bridge"),
-    ),
-    "discord": (
-        os.environ.get("ZEROCLAW_DISCORD_CFG", "/root/.zeroclaw-discord/config.toml"),
-        os.environ.get("ZEROCLAW_DISCORD_UNIT", "zeroclaw-discord"),
-    ),
-}
 
 
 def _admin_require_localhost(request: Request) -> None:
     host = request.client.host if request.client else ""
     if host not in ("127.0.0.1", "::1", "localhost"):
         raise HTTPException(status_code=403, detail="admin endpoints are localhost-only")
-
-
-def _admin_schedule_restart(unit: str, delay: float = 2.0) -> None:
-    """Spawn detached `sleep N && systemctl restart UNIT` so the HTTP
-    response can flush before the bridge SIGTERMs itself. start_new_session
-    detaches the child from the parent's process group so it survives the
-    SIGTERM cascade."""
-    import subprocess
-    subprocess.Popen(
-        ["bash", "-c", f"sleep {delay} && systemctl restart {unit}"],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
 
 
 class _AdminKidModeIn(BaseModel):
@@ -5525,11 +771,6 @@ class _AdminPersonaIn(BaseModel):
     content: str
 
 
-class _AdminModelIn(BaseModel):
-    daemon: str
-    model: str
-
-
 class _AdminSafetyIn(BaseModel):
     action: str
     tool: str
@@ -5542,10 +783,6 @@ _admin_router = APIRouter(
 
 @_admin_router.post("/kid-mode")
 async def _admin_kid_mode(payload: _AdminKidModeIn) -> dict:
-    # kid_mode is guardrails only (content sandwich, denied tools, persona)
-    # — model selection lives on smart_mode. Hot-reloaded in-process via
-    # `_apply_kid_mode` so no daemon restart is needed; the firmware pip
-    # update is pushed live by `_dispatch_set_toggle`.
     _write_kid_mode(payload.enabled)
     _apply_kid_mode(payload.enabled)
     pushed = await _dispatch_set_toggle(
@@ -5560,13 +797,8 @@ async def _admin_kid_mode(payload: _AdminKidModeIn) -> dict:
 
 @_admin_router.post("/smart-mode")
 async def _admin_smart_mode(payload: _AdminSmartModeIn) -> dict:
-    """Flip smart_mode toggle. Owns voice-daemon model selection: ON →
-    SMART_MODEL (claude-sonnet-4-6), OFF → DEFAULT_MODEL (local). Under
-    DOTTY_VOICE_PROVIDER=tier1slim, this is a sub-second hot-mutation of
-    the live Tier1Slim provider in xiaozhi-server via /xiaozhi/admin/
-    set-tier1slim-model — no restart. Otherwise the legacy ZeroClaw
-    config.toml rewrite + systemctl restart applies. Pip update is pushed
-    via /xiaozhi/admin/set-toggle so it lands live in either case."""
+    """Flip smart_mode + push the LED pip + hot-swap the live Tier1Slim
+    provider. Pre-#36 zeroclaw config.toml-rewrite path is gone."""
     _write_smart_mode(payload.enabled)
     pushed = await _dispatch_set_toggle(
         payload.device_id, "smart_mode", payload.enabled,
@@ -5578,21 +810,17 @@ async def _admin_smart_mode(payload: _AdminSmartModeIn) -> dict:
             "ok": True, "enabled": payload.enabled, "device_pushed": pushed,
             "model": t_model, "swap_ok": swap_ok, "provider": "tier1slim",
         }
-    target_model = SMART_MODEL if payload.enabled else DEFAULT_MODEL
-    cfg_path, unit = _apply_model_swap("voice", target_model)
-    _admin_schedule_restart(unit)
     return {
         "ok": True, "enabled": payload.enabled, "device_pushed": pushed,
-        "model": target_model, "config": cfg_path, "restart": unit,
+        "provider": DOTTY_VOICE_PROVIDER,
+        "warning": "DOTTY_VOICE_PROVIDER is not 'tier1slim' — no model swap performed",
     }
 
 
 @_admin_router.post("/state")
 async def _admin_state(payload: _AdminStateIn) -> dict:
-    """Phase 4 — dashboard / external trigger to set Dotty's high-level state.
-    Valid: idle / talk / story_time / security / sleep / dance. Pushes
-    self.robot.set_state MCP via the xiaozhi-server relay; the firmware
-    StateManager handles the transition. No daemon restart."""
+    """Dashboard / external trigger to set Dotty's high-level state.
+    Valid: idle / talk / story_time / security / sleep / dance."""
     valid = ("idle", "talk", "story_time", "security", "sleep", "dance")
     if payload.state not in valid:
         raise HTTPException(
@@ -5605,6 +833,12 @@ async def _admin_state(payload: _AdminStateIn) -> dict:
 
 @_admin_router.post("/persona")
 async def _admin_persona(payload: _AdminPersonaIn) -> dict:
+    """Write a persona-file under the configured workspace dir. Edits
+    used to take effect on the next zeroclaw restart; with the voice
+    path moved to dotty-pi, the receiving end depends on
+    DOTTY_PERSONA_DIR being aimed at a dir dotty-pi reads. Kept on the
+    bridge so external operator scripts have a single localhost-only
+    surface for hot-editing persona files."""
     if payload.file not in _ADMIN_ALLOWED_PERSONA_FILES:
         raise HTTPException(
             status_code=400,
@@ -5622,218 +856,13 @@ async def _admin_persona(payload: _AdminPersonaIn) -> dict:
     }
 
 
-def _read_voice_model_from_cfg() -> str | None:
-    """Return the current `model = "..."` value of the voice daemon's
-    active provider profile, or None if the file/section is missing.
-
-    In multi-profile mode (VOICE_LOCAL_PROFILE_KEY set), the active
-    profile is whichever `[providers].fallback` points at. In legacy
-    mode, it's the only `custom:URL` section."""
-    cfg_path, _ = _ADMIN_DAEMON_CFG["voice"]
-    cfg_p = Path(cfg_path)
-    if not cfg_p.exists():
-        return None
-    try:
-        src = cfg_p.read_text()
-    except OSError:
-        return None
-
-    if VOICE_LOCAL_PROFILE_KEY:
-        fb = re.search(r'^fallback = "([^"]+)"$', src, flags=re.MULTILINE)
-        if fb is None:
-            return None
-        active_key = fb.group(1)
-        section_pat = f'[providers.models."{active_key}"]'
-        sec_start = src.find(section_pat)
-        if sec_start < 0:
-            return None
-    else:
-        section_re = re.compile(r'\[providers\.models\."custom:[^"]+"\]')
-        m = section_re.search(src)
-        if not m:
-            return None
-        sec_start = m.start()
-    sec_end = src.find("\n[", sec_start + 1)
-    if sec_end == -1:
-        sec_end = len(src)
-    section = src[sec_start:sec_end]
-    cur = re.search(r'^model = "([^"]+)"$', section, flags=re.MULTILINE)
-    return cur.group(1) if cur else None
-
-
-def _reconcile_voice_model_at_startup() -> None:
-    """Bridge owns the source of truth for which model the voice daemon runs
-    on (smart_mode state file → DEFAULT_MODEL or SMART_MODEL). On startup,
-    push the desired state at the live provider so the next turn lands on
-    the right model.
-
-    Under DOTTY_VOICE_PROVIDER=tier1slim, fire one POST at the xiaozhi
-    admin endpoint — covers both bridge-restart-after-flip and
-    xiaozhi-restart-which-reverted-to-yaml cases. Best-effort: failures are
-    logged but don't block startup, and the next dashboard flip will
-    re-attempt anyway. Otherwise (legacy ZeroClaw path), if config.toml
-    drifts, rewrite + schedule a daemon restart."""
-    smart = _read_smart_mode()
-    if DOTTY_VOICE_PROVIDER == "tier1slim":
-        t_model, t_url, t_api = _tier1slim_target_for_smart_mode(smart)
-
-        async def _push() -> None:
-            ok = await _dispatch_set_tier1slim_model(t_model, t_url, t_api)
-            if ok:
-                log.info(
-                    "startup tier1slim reconcile: pushed model=%r (smart_mode=%s)",
-                    t_model, smart,
-                )
-            else:
-                log.warning(
-                    "startup tier1slim reconcile failed: model=%r (smart_mode=%s) "
-                    "— next dashboard flip will retry",
-                    t_model, smart,
-                )
-
-        try:
-            asyncio.get_running_loop().create_task(_push())
-        except RuntimeError:
-            # Called outside an event loop (early lifespan path) — schedule
-            # via run_until_complete fallback. asyncio.run isn't safe here
-            # because lifespan owns the loop; just log and move on, the
-            # first smart-mode flip will fix it.
-            log.warning(
-                "startup tier1slim reconcile: no running loop, deferring to first flip",
-            )
-        return
-
-    target = SMART_MODEL if smart else DEFAULT_MODEL
-    current = _read_voice_model_from_cfg()
-    if current is None:
-        log.warning(
-            "startup model reconcile: voice config.toml unreadable — skipping",
-        )
-        return
-    if current == target:
-        log.info(
-            "startup model reconcile: voice daemon already on %r (smart_mode=%s)",
-            target, smart,
-        )
-        return
-    try:
-        _, unit = _apply_model_swap("voice", target)
-        _admin_schedule_restart(unit)
-        log.info(
-            "startup model reconcile: voice daemon %r -> %r (smart_mode=%s, restart scheduled)",
-            current, target, smart,
-        )
-    except Exception:
-        log.exception("startup model reconcile failed")
-
-
-def _voice_profile_for_model(model: str) -> str | None:
-    """Map a target model to the voice config profile that should own it.
-    Returns None when multi-profile mode is not configured (caller falls
-    back to legacy single-section behavior).
-
-    In multi-profile mode, DEFAULT_MODEL routes to the local profile and
-    everything else (including SMART_MODEL) routes to the cloud profile.
-    Cloud is the safe default for unknown IDs since cloud providers
-    (OpenRouter) accept arbitrary model strings; Ollama would 404."""
-    if not VOICE_LOCAL_PROFILE_KEY:
-        return None
-    if model == DEFAULT_MODEL:
-        return VOICE_LOCAL_PROFILE_KEY
-    return VOICE_CLOUD_PROFILE_KEY
-
-
-def _apply_model_swap(daemon: str, model: str) -> tuple[str, str]:
-    """Rewrite the `model = "..."` line inside the appropriate provider
-    section of the named daemon's config.toml. Returns (cfg_path, unit).
-    Caller is responsible for scheduling the systemctl restart.
-
-    Voice daemon supports multi-profile mode: when VOICE_LOCAL_PROFILE_KEY
-    is set, the function picks the right `[providers.models.<KEY>]`
-    section by model name AND repoints `[providers].fallback` at it.
-    Without the env var, falls back to legacy single-section behavior."""
-    if daemon not in _ADMIN_DAEMON_CFG:
-        raise HTTPException(
-            status_code=400,
-            detail=f"daemon must be one of {sorted(_ADMIN_DAEMON_CFG)}",
-        )
-    if not re.fullmatch(r"[A-Za-z0-9./:_-]+", model):
-        raise HTTPException(status_code=400, detail="model id has invalid chars")
-    cfg_path, unit = _ADMIN_DAEMON_CFG[daemon]
-    cfg_p = Path(cfg_path)
-    if not cfg_p.exists():
-        raise HTTPException(status_code=404, detail=f"config not found: {cfg_path}")
-    src = cfg_p.read_text()
-
-    profile_key = _voice_profile_for_model(model) if daemon == "voice" else None
-    if profile_key:
-        section_pat = f'[providers.models."{profile_key}"]'
-        sec_start = src.find(section_pat)
-        if sec_start < 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"profile section not found: {section_pat}",
-            )
-        sec_end = src.find("\n[", sec_start + 1)
-        if sec_end == -1:
-            sec_end = len(src)
-        section = src[sec_start:sec_end]
-        new_section, n = re.subn(
-            r'^model = ".*"$',
-            f'model = "{model}"',
-            section, count=1, flags=re.MULTILINE,
-        )
-        if n == 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"model line not found in profile {profile_key!r}",
-            )
-        src = src[:sec_start] + new_section + src[sec_end:]
-        src, fb_n = re.subn(
-            r'^fallback = "[^"]+"$',
-            f'fallback = "{profile_key}"',
-            src, count=1, flags=re.MULTILINE,
-        )
-        if fb_n == 0:
-            raise HTTPException(
-                status_code=500,
-                detail="[providers].fallback line not found",
-            )
-        cfg_p.write_text(src)
-        return (cfg_path, unit)
-
-    section_re = re.compile(r'\[providers\.models\."custom:[^"]+"\]')
-    m = section_re.search(src)
-    if not m:
-        raise HTTPException(status_code=500, detail="provider section not found")
-    sec_start = m.start()
-    sec_end = src.find("\n[", sec_start + 1)
-    if sec_end == -1:
-        sec_end = len(src)
-    section = src[sec_start:sec_end]
-    new_section, n = re.subn(
-        r'^model = ".*"$',
-        f'model = "{model}"',
-        section, count=1, flags=re.MULTILINE,
-    )
-    if n == 0:
-        raise HTTPException(status_code=500, detail="model line not found")
-    cfg_p.write_text(src[:sec_start] + new_section + src[sec_end:])
-    return (cfg_path, unit)
-
-
-@_admin_router.post("/model")
-async def _admin_model(payload: _AdminModelIn) -> dict:
-    cfg_path, unit = _apply_model_swap(payload.daemon, payload.model)
-    _admin_schedule_restart(unit)
-    return {
-        "ok": True, "daemon": payload.daemon, "model": payload.model,
-        "config": cfg_path, "restart": unit,
-    }
-
-
 @_admin_router.post("/safety")
 async def _admin_safety(payload: _AdminSafetyIn) -> dict:
+    """Add / remove a tool from MCP_TOOL_ALLOWLIST. Edits the literal in
+    place between the ADMIN_ALLOWLIST markers so the change persists
+    across restarts. Note: the voice/MCP path that read this list lived
+    in ZeroClaw and is gone — this endpoint is now a static-edit surface
+    rather than a live policy mutation."""
     if payload.action not in ("add", "remove"):
         raise HTTPException(status_code=400, detail="action must be 'add' or 'remove'")
     if not re.fullmatch(r"[A-Za-z0-9._]+", payload.tool):
@@ -5872,208 +901,11 @@ async def _admin_safety(payload: _AdminSafetyIn) -> dict:
         new_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=f"py_compile failed: {exc}")
     new_path.replace(self_path)
-    _admin_schedule_restart(_ADMIN_DAEMON_CFG["voice"][1])
     return {
         "ok": True, "action": payload.action, "tool": payload.tool,
         "size_before": before_size, "size_after": len(new_items),
-        "restart": _ADMIN_DAEMON_CFG["voice"][1],
+        "note": "bridge.py allowlist updated; restart bridge to pick up the new value in-process",
     }
 
 
 app.include_router(_admin_router)
-
-
-@app.post("/api/message/stream")
-async def message_stream(payload: MessageIn) -> StreamingResponse:
-    """NDJSON-streaming variant of /api/message.
-
-    Emits one JSON line per token-level chunk as the LLM produces it:
-        {"type":"chunk","content":"..."}
-    Ends with a single final line (after the LLM turn completes):
-        {"type":"final","content":"<full text>","session_id":"..."}
-    or on error:
-        {"type":"error","message":"...","session_id":"..."}
-
-    The first non-whitespace character across all emitted chunks is checked
-    against ALLOWED_EMOJIS; if the LLM forgot its emoji leader, FALLBACK_EMOJI
-    is prepended to the first chunk before it goes out. This keeps the face
-    animation protocol intact without waiting for the full response.
-    """
-    session_id = payload.session_id or str(uuid.uuid4())
-    log.info(
-        "stream channel=%s session=%s len=%d",
-        payload.channel, session_id, len(payload.content),
-    )
-    _record_last_user_line(
-        (payload.metadata or {}).get("device_id"), payload.content,
-    )
-    await _refresh_caches()
-    speaker = _resolve_speaker_for_request(payload)
-    person_memory_block = None
-    if speaker is not None and speaker.person_id:
-        log.info(
-            "speaker channel=%s person=%s addressee=%s conf=%.2f signals=%s",
-            payload.channel, speaker.person_id, speaker.addressee,
-            speaker.confidence,
-            ",".join(v.signal for v in speaker.votes) or "-",
-        )
-        person_memory_block = await asyncio.to_thread(
-            _build_person_memory_block, speaker.person_id,
-        )
-
-    # `t_request_start` is captured per-request and read inside on_chunk
-    # so the first-audio histogram observes the elapsed time at the
-    # exact point the bridge emits its first content chunk to the client.
-    t_request_start = perf_counter()
-    queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
-    state = {
-        "seen_nonws": False, "blocked": False,
-        "sentence_ends": 0, "truncated": False,
-        "first_audio_recorded": False,
-    }
-
-    async def on_chunk(content: str) -> None:
-        content = clean_for_tts(content)
-        if not content:
-            return
-        if state["blocked"] or state["truncated"]:
-            return
-        replacement = content_filter(content)
-        if replacement:
-            log.warning("content-filter-hit-stream chunk_len=%d", len(content))
-            state["blocked"] = True
-            state["seen_nonws"] = True
-            await queue.put(("chunk", replacement))
-            return
-        if not state["seen_nonws"]:
-            stripped = content.lstrip()
-            if stripped:
-                state["seen_nonws"] = True
-                if not any(stripped.startswith(e) for e in ALLOWED_EMOJIS):
-                    content = f"{FALLBACK_EMOJI} " + content
-                # First chunk that carries non-whitespace content == the
-                # first-audio milestone from the bridge's perspective.
-                # xiaozhi-server pipelines TTS synthesis off of this, so
-                # (bridge_first_chunk + tts_synth_first) ~= true audible
-                # latency on-device. We capture the bridge half here.
-                if _METRICS_AVAILABLE and not state["first_audio_recorded"]:
-                    state["first_audio_recorded"] = True
-                    _safe_metric(
-                        record_first_audio,
-                        perf_counter() - t_request_start,
-                    )
-        out = []
-        for ch in content:
-            out.append(ch)
-            if ch in '.!?':
-                state["sentence_ends"] += 1
-                if state["sentence_ends"] >= MAX_SENTENCES:
-                    state["truncated"] = True
-                    break
-        content = ''.join(out)
-        if content:
-            await queue.put(("chunk", content))
-
-    async def run_turn() -> None:
-        t0 = perf_counter()
-        error_msg = None
-        full = ""
-        try:
-            full = await asyncio.wait_for(
-                acp.prompt(
-                    payload.content,
-                    xiaozhi_sid=payload.session_id,
-                    chunk_cb=on_chunk,
-                    prepare=_voice_preparer(
-                        payload.channel, speaker,
-                        room_description=(payload.metadata or {}).get(
-                            "room_description"),
-                        device_id=(payload.metadata or {}).get("device_id"),
-                        person_memory_block=person_memory_block,
-                    ),
-                ),
-                timeout=REQUEST_TIMEOUT_SEC,
-            )
-            full = clean_for_tts(full)
-            if not state["blocked"]:
-                final_hit = content_filter(full)
-                if final_hit is not None:
-                    full = final_hit
-                    state["blocked"] = True
-            if state["blocked"]:
-                full = CONTENT_FILTER_REPLACEMENT
-            full = ensure_emoji_prefix(full)
-            full = strip_extra_emojis(full)
-            full = truncate_sentences(full)
-            if not state["seen_nonws"]:
-                await queue.put(("chunk", full))
-            await queue.put(("final", full))
-        except asyncio.TimeoutError:
-            log.warning("ACP timeout (stream)")
-            error_msg = "timeout"
-            await queue.put(("error", f"{FALLBACK_EMOJI} I'm thinking too slowly right now, try again."))
-        except FileNotFoundError:
-            log.exception("zeroclaw binary missing (stream)")
-            error_msg = "binary_missing"
-            await queue.put(("error", f"{FALLBACK_EMOJI} My AI brain is offline."))
-        except Exception:
-            log.exception("ACP invocation failed (stream)")
-            error_msg = "exception"
-            await queue.put(("error", f"{FALLBACK_EMOJI} Something went wrong, please try again."))
-        elapsed_s = perf_counter() - t0
-        if _METRICS_AVAILABLE:
-            _safe_metric(
-                dotty_request_duration_seconds.labels(
-                    endpoint="message_stream",
-                ).observe,
-                elapsed_s,
-            )
-            if error_msg:
-                _safe_metric(
-                    dotty_request_errors_total.labels(
-                        endpoint="message_stream", kind=error_msg,
-                    ).inc,
-                )
-        _convo_log.log_turn(
-            channel=payload.channel or "",
-            session_id=session_id,
-            request_text=payload.content,
-            response_text=full,
-            latency_ms=elapsed_s * 1000.0,
-            error=error_msg,
-            latency_phases=dict(acp._last_phases) if acp._last_phases else None,
-        )
-
-    async def gen():
-        task = asyncio.create_task(run_turn())
-        try:
-            while True:
-                kind, data = await queue.get()
-                if kind == "chunk":
-                    yield json.dumps({"type": "chunk", "content": data}, ensure_ascii=False) + "\n"
-                elif kind == "final":
-                    yield json.dumps(
-                        {"type": "final", "content": data, "session_id": session_id},
-                        ensure_ascii=False,
-                    ) + "\n"
-                    break
-                elif kind == "error":
-                    yield json.dumps(
-                        {"type": "error", "message": data, "session_id": session_id},
-                        ensure_ascii=False,
-                    ) + "\n"
-                    break
-        finally:
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
