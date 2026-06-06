@@ -22,6 +22,12 @@ I didn't like the idea of a camera and microphone running in my house unless I c
 
 So Dotty is the version that passes: every component runs on hardware I own, every seam is documented and swappable, and the only thing that can leave the LAN is whatever LLM call I explicitly route out (and even that swaps to a local model with a config change). It's also meant to be fun — a friendly desktop robot for the kids, and an interesting hobby project to keep building on.
 
+## AI transparency
+
+**Yes — Dotty is built with AI assistance, and it says so out loud.** Coding agents help write the code, draft the docs, and triage issues — a deliberate choice, not a secret. The rule: **anything an AI agent authors is acknowledged as such** (model-named `Co-Authored-By:` trailers, AI-assisted PR notes, marked AI-drafted docs), with a human reviewing and accountable for everything that lands.
+
+Full policy: [`AI_TRANSPARENCY.md`](./AI_TRANSPARENCY.md).
+
 ## Features
 
 - **Kid Mode (on by default)** — age-appropriate responses via persona + per-turn prompt steering. An output content filter is planned, not yet shipped ([#138](https://github.com/BrettKinny/dotty-stackchan/issues/138)); Kid Mode is not a substitute for supervision. Toggle off for general-purpose use. See [`docs/kid-mode.md`](./docs/kid-mode.md).
