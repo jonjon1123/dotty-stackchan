@@ -118,6 +118,8 @@ services:
       - ./custom-providers/xiaozhi-patches/http_server.py:/opt/xiaozhi-esp32-server/core/http_server.py:ro
       # DOTTY ambient perception: relay firmware "event" frames to dotty-behaviour
       - ./custom-providers/xiaozhi-patches/textMessageHandlerRegistry.py:/opt/xiaozhi-esp32-server/core/handle/textMessageHandlerRegistry.py:ro
+      - ./custom-providers/asr/sensevoice_onnx.py:/opt/xiaozhi-esp32-server/core/providers/asr/sensevoice_onnx.py:ro
+      - ./models/SenseVoiceSmall-onnx:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall-onnx:ro
       # OTA: patched ota_handler that composes firmware download URLs directly
       # (upstream's vision_url.replace path was a no-op when vision_explain
       # doesn't contain "/mcp/vision/explain"). See docs/ota-verification.md.
