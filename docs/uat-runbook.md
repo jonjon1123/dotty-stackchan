@@ -246,7 +246,9 @@ Same as the bench runbook:
    with expected/actual, log excerpt, clip filename; labels `needs-triage` +
    matching `area:*`. Known-pending fails (US2, US6, UL4, UD6) **update their
    existing tracking issues** instead. UR1 divergence → comment on #21.
-4. **Publish**: work through `clips/shorts/` per the upload checklist in
+4. **Publish** to the live channel
+   ([youtube.com/@dotty-stackchan](https://www.youtube.com/@dotty-stackchan)):
+   work through `clips/shorts/` per the upload checklist in
    [`uat-social.md`](./uat-social.md); paste each video URL back into the
    results CSV `note` column.
 5. **Wrap-up**: comment the pass/fail counts + results CSV location on the

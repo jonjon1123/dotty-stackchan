@@ -13,16 +13,51 @@ is written in her first-person voice.
 > **AI-assistance note:** this document was drafted by an AI agent (Claude)
 > and reviewed by a human, per [`AI_TRANSPARENCY.md`](../AI_TRANSPARENCY.md).
 
+## The channel
+
+The channel is live: **[youtube.com/@dotty-stackchan](https://www.youtube.com/@dotty-stackchan)**
+("Dotty", channel ID `UCUCUetN5vt2w0ZcCti7R1ZQ`, Australia, joined
+2026-04-28), with bench-test Shorts already published. Its About text is the
+canonical voice sample — first-person, privacy-first, human credited:
+
+> Hi, I'm Dotty,
+>
+> I'm a small desk robot, an M5 stack-chan build with an ESP32 body and a
+> local LLM for a brain. No cloud AI, no subscription, no data leaving the
+> house. Just me, a Raspberry Pi, and the Unraid server in the corner.
+>
+> This channel is mostly candids: me reacting, listening, getting confused,
+> telling stories, occasionally being dramatic about the lights on my head.
+> My human writes the captions and points the camera and occasionally speaks.
+
+It also links the repo. That About page already satisfies the channel-level
+disclosure requirement (below) — the per-video footer rule still applies.
+
+Conventions the existing uploads established (adopt, don't fight):
+
+- **Hashtags in the title**: `#dotty #stackchan #esp32 #localllm` (+ one or
+  two check-specific tags).
+- **`(WIP)` title suffix** for unfinished features — e.g. *"Hey dotty,
+  what's on the calendar? (WIP)"*.
+- **Check IDs in titles are fine** — *"Dotty bench test #45 - LED voice
+  feedback…"* set the precedent; UAT check IDs (UB1, US14…) slot in the
+  same way.
+
 ## The channel voice
 
 Dotty's written voice matches her spoken persona
-([`personas/dotty_voice.md`](../personas/dotty_voice.md)): warm, curious,
-cheerful, a little wide-eyed. Rules:
+([`personas/dotty_voice.md`](../personas/dotty_voice.md)) and the channel
+About page: warm, curious, cheerful, a little wide-eyed. Rules:
 
 - **First person, always.** "I learned a new dance today", never "Dotty
-  learns a dance" or "I taught my robot…".
-- **Brett is "my human".** He appears in clips but never as the narrator
-  persona. He has no byline.
+  learns a dance" or "I taught my robot…". (Some early uploads drift
+  third-person; first-person is the go-forward standard.)
+- **Brett is "my human"** — the About page's own words. He appears in clips
+  but never as the narrator persona. He has no byline.
+- **The privacy hook is a recurring angle.** "No cloud AI, no subscription,
+  no data leaving the house" is the channel's opening pitch — clips that can
+  honestly show it (everything running while the internet is unplugged, the
+  Unraid box in the corner, local TTS latency) should lean into it.
 - **Short sentences, genuine curiosity, no snark.** She's discovering her
   own features alongside the audience.
 - **Honest about being a robot in progress.** She can say "this part of me
@@ -36,9 +71,10 @@ cheerful, a little wide-eyed. Rules:
 
 | Check | Title (as Dotty) |
 |---|---|
-| UC1 | 😊 Hello! I'm Dotty and I live on a desk |
-| UC3 | 🤔 I have exactly nine faces. Here are all of them |
-| UT2 | 😮 My human tested my memory… and I passed |
+| UC1 | 😊 Hello! I'm Dotty and I live on a desk #dotty #stackchan #localllm |
+| UC3 | 🤔 I have exactly nine faces. Here are all of them #dotty #esp32 |
+| UT2 | 😮 My human tested my memory… and I passed #dotty #stackchan #localllm |
+| US2 | 😐 I don't know how to finish a story yet (WIP) #dotty #stackchan |
 | UT6 | 🤔 The question that made me think REALLY hard |
 | UT7 | 😆 My human showed me a banana to see what I'd say |
 | US8 | 😴 How I go to sleep (yes, I snore a little) |
@@ -52,7 +88,9 @@ cheerful, a little wide-eyed. Rules:
 ## Per-clip metadata template
 
 ```
-Title:        <emoji> <first-person hook, ≤80 chars>
+Title:        <emoji> <first-person hook> <#dotty #stackchan #esp32 #localllm
+              + check-specific tags; "(WIP)" suffix before the tags if the
+              feature is known-pending; ≤100 chars all-in>
 
 Description:
 <1–3 first-person sentences about what happens in the clip.>
@@ -82,7 +120,8 @@ person:
 
 1. **Channel About page** states plainly: Dotty is an AI-powered robot;
    the channel is written in her voice by her humans with AI assistance;
-   the project is open source.
+   the project is open source. *(Already satisfied — the live About text
+   quoted above covers all three; keep it that way when editing.)*
 2. **Every description footer** (template above) links the repo and says
    what she is.
 3. **YouTube's altered/synthetic content disclosure**: tick it where the
@@ -111,8 +150,10 @@ person:
    the cut points and that no stray personal info is in frame/audio).
 2. Vertical? Under 60 s? Trim in the editor if the slicer's pad overshot.
 3. Write title + description from the template, in Dotty's voice.
-4. Set kids-content flag appropriately (this channel will usually be "yes,
-   made for kids" — decide once, per channel policy, not per clip).
+4. Set the made-for-kids flag per the channel's standing policy (decide it
+   once, not per clip — the existing uploads are maker-audience content, and
+   "made for kids" disables comments and changes Shorts-feed behaviour, so
+   the tone-rule "kid-safe" does not automatically mean the flag is "yes").
 5. Tick the synthetic-content disclosure if applicable (see above).
 6. Upload as a Short; add to the session's playlist.
 7. Paste the video URL into the results CSV `note` column for that check —
