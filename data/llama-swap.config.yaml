@@ -1,0 +1,75 @@
+healthCheckTimeout: 90
+logLevel: debug
+startPort: 10001
+
+models:
+  # Voice chitchat: small, fast, pinned to one GPU
+  "default":
+    cmd: |
+      llama-server
+      -m /models/Qwen3.5-4B/Qwen3.5-4B-Q5_K_M.gguf
+      -ngl 99
+      -c 4096
+      -fa on
+      --cache-type-k f16
+      --cache-type-v f16
+      -np 1
+      --reasoning off
+      --host 127.0.0.1
+      --port ${PORT}
+      --alias default
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 1800
+
+  # Voice escalation: big model at small context, layer-split with weight
+  # toward the GPU that isn't already hosting default
+  "think-small":
+    cmd: |
+      llama-server
+      -m /models/Qwen3.5-4B/Qwen3.5-4B-Q5_K_M.gguf
+      -ngl 99
+      -sm layer
+      -ts 1,1.5
+      -c 8192
+      -fa on
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      -np 1
+      --host 127.0.0.1
+      --port ${PORT}
+      --alias think-small
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 1800
+
+  # Coding agent: same big model, full context, runs alone
+  "think-big":
+    cmd: |
+      llama-server
+      -m /models/Qwen3.5-27B/Qwen3.5-27B-UD-IQ2_M.gguf
+      -ngl 99
+      -sm layer
+      -c 98304
+      -fa on
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      -np 1
+      --host 127.0.0.1
+      --port ${PORT}
+      --alias think-big
+    env:
+      - "CUDA_VISIBLE_DEVICES=''" # restrict to not using the GPU and only CPU and larger amount of CPU RAM
+    proxy: http://127.0.0.1:${PORT}
+    ttl: 1800
+
+# Concurrency matrix: declare which model combinations are allowed.
+matrix:
+  vars:
+    cs: default
+    ts: think-small
+    tb: think-big
+
+  sets:
+    # Two voice models coexist
+    voice: "cs & ts"
+    # Big-context profile runs alone — evicts the voice pair when called
+    coding: "tb"

@@ -57,3 +57,7 @@ package-lock.json
 # Downloaded ASR/TTS model weights (fetched by `make fetch-models`). Big
 # binaries, easy to regenerate; not part of the repo.
 /models/
+
+# Runtime state (logs, secrets, shared toggle files, pi brain data).
+# Created by docker compose; not part of the repo.
+/state/

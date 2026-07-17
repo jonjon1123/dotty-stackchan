@@ -48,8 +48,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PI_FLAGS = (
     "--mode", "rpc",
-    "--provider", "ollama",
-    "--model", "qwen3.5:4b",
+    "--provider", "default",
+    "--model", "default",
     "--no-session",
     "--no-context-files",
     "--offline",

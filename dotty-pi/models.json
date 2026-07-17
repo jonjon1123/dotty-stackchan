@@ -1,7 +1,7 @@
 {
   "providers": {
-    "ollama": {
-      "baseUrl": "http://localhost:8080/v1",
+    "default": {
+      "baseUrl": "http://llama-swap:8080/v1",
       "api": "openai-completions",
       "apiKey": "dummy",
       "compat": {
@@ -10,8 +10,8 @@
       },
       "models": [
         {
-          "id": "qwen3.5:4b",
-          "name": "Qwen3.5 4B (Unraid llama.cpp, voice set)",
+          "id": "default",
+          "name": "default",
           "reasoning": false,
           "input": ["text"],
           "contextWindow": 4096,
@@ -19,8 +19,8 @@
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
         },
         {
-          "id": "qwen3.6:27b-think",
-          "name": "Qwen3.6 27B think (Unraid llama.cpp, voice set, 8K)",
+          "id": "think-big",
+          "name": "think-big",
           "reasoning": true,
           "input": ["text"],
           "contextWindow": 8192,
@@ -28,8 +28,8 @@
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
         },
         {
-          "id": "qwen3.6:27b",
-          "name": "Qwen3.6 27B (Unraid llama.cpp, coding set, 96K — EVICTS VOICE)",
+          "id": "think-small",
+          "name": "think-small",
           "reasoning": true,
           "input": ["text"],
           "contextWindow": 32768,

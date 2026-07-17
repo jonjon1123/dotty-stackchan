@@ -254,17 +254,16 @@ class LLMProvider(LLMProviderBase):
             ):
                 yield chunk
         except PiClientError as exc:
-            logger.error("PiVoiceLLM turn failed: %s", exc)
+            logger.error(f"PiVoiceLLM turn failed: {exc}", exc_info=True)
             for line in self._client.recent_stderr()[-5:]:
-                logger.error("  pi.stderr: %s", line)
+                logger.error(f"  pi.stderr: {line}")
             yield f"{FALLBACK_EMOJI} (brain offline — try again in a moment)"
 
     def _on_filter_hit(self, tier: str, match) -> None:
         # Local logging only — the Prometheus counter / safety ring live in
         # the bridge container, which this provider can't reach.
         logger.warning(
-            "PiVoiceLLM content-filter hit tier=%s pattern=%r — turn replaced",
-            tier, match.group(),
+            f"PiVoiceLLM content-filter hit tier={tier} pattern={match.group()!r} — turn replaced",
         )
 
     def close(self) -> None:
