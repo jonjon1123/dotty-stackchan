@@ -225,9 +225,8 @@ names — no IPs, no host networking.
 
 ## Firmware
 
-This project includes a fork of the [StackChan firmware](https://github.com/m5stack/StackChan/tree/main/firmware) at `firmware/firmware/`
-(a git submodule pinned to `BrettKinny/StackChan @ dotty`). The StackChan
-device must be flashed with this firmware — it includes Dotty-specific
+This project includes [customized firmware](https://github.com/BrettKinny/StackChan) at `firmware/firmware/`.
+The `firmware/firmware/` directory is a git submodule that is a [fork](https://github.com/jonjon1123/dotty-firmware) of the [customized firmware](https://github.com/BrettKinny/StackChan) pinned to `jonjon1123/dotty-firmware @ dotty`. The StackChan device must be flashed with this firmware — it includes Dotty-specific
 additions that the server stack depends on: the six-state StateManager,
 perception event emission, MCP tool handlers, and the emotion protocol.
 
