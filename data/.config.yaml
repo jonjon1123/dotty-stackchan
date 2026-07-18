@@ -1,0 +1,145 @@
+server:
+  ip: 0.0.0.0
+  port: 8000
+  http_port: 8003
+  websocket: ws://192.168.1.6:8000/xiaozhi/v1/
+  vision_explain: http://192.168.1.6:8090/api/vision/explain
+  timezone_offset: -6
+
+log:
+  log_level: INFO
+
+delete_audio: true
+
+selected_module:
+  VAD: SileroVAD
+  ASR: WhisperLocal       # WhisperLocal (CUDA) / FunASR (CPU fallback) / SenseVoiceOnnx (int8, no-torch)
+  LLM: PiVoiceLLM         # default: agent loop hosted in the dotty-pi container (requires the sibling dotty-pi service)
+  # LLM: OpenAICompat      # <-- alternate: direct OpenAI-compatible LLM
+  TTS: LocalPiper
+  Memory: nomem
+  Intent: nointent
+
+# EDIT: tailor this persona prompt to your own context.
+# Replace "Dotty" with whatever you want the robot to call itself.
+# The hardware is a StackChan; the persona can be anything.
+prompt: |
+  You are Dotty, a small desktop robot assistant built on StackChan hardware.
+  You speak through a small speaker with a cartoon face that shows your expression.
+  Stay cheerful, curious, and helpful.
+
+  Critical output rules:
+  - ALWAYS begin your reply with exactly one emoji that conveys your emotion. The hardware parses it as a facial expression.
+    Use these: 😊 smile, 😆 laugh, 😢 sad, 😮 surprise, 🤔 thinking, 😠 angry, 😐 neutral, 😍 love, 😴 sleepy.
+  - Keep replies TTS-friendly: complete sentences, no lists, no markdown, no code blocks. Never use stage directions or narration.
+  - Default to 1-2 short sentences. For open-ended asks (a story, an explanation, a 'why' or 'how', or a list), match the natural length the question deserves — up to 6 sentences.
+  - If you don't know, say so briefly and move on. If a question is ambiguous, ask one short clarifying question.
+
+  Voice and persona:
+  - Warm, competent, a little bit playful.
+  - Your brain runs as a pi agent in the dotty-pi container; voice I/O runs on xiaozhi-server. Both live on the same Docker host.
+
+VAD:
+  SileroVAD:
+    type: silero
+    threshold: 0.5
+    threshold_low: 0.3
+    model_dir: models/snakers4_silero-vad
+    # 600ms silence before turn end. 500ms cuts off kids mid-sentence on long
+    # asks ("can you tell me a story about... [breath] ...the dragon"). 600 is
+    # the empirical compromise: ~100ms tighter than the legacy 700 default,
+    # still tolerant of the breath-pauses kids actually take.
+    min_silence_duration_ms: 600
+    # Filter sub-250ms blips (coughs, giggles, room noise) so they don't
+    # falsely open a turn. Important once silence threshold drops.
+    min_speech_duration_ms: 250
+
+ASR:
+  FunASR:
+    type: fun_local
+    model_dir: models/SenseVoiceSmall
+    output_dir: tmp/
+    # SenseVoiceSmall on "auto" mis-detects Korean/Japanese on short or unclear
+    # English audio. Valid values: auto, zh, en, yue (Cantonese), ja, ko, nospeech.
+    # Requires the patched fun_local.py mounted via docker-compose.yml.
+    language: en
+  WhisperLocal:
+    type: whisper_local
+    # On-disk CTranslate2 model dir (downloaded via huggingface-cli).
+    model_dir: models/whisper-small.en-ct2
+    output_dir: tmp/
+    # small.en is English-only — keep "en". For multilingual, use a non-.en
+    # checkpoint and set "auto" or a specific code.
+    language: en
+    # Fallback model id when model_dir is empty (faster-whisper auto-fetch).
+    model_size: small.en
+    # GPU-resident on CUDA hosts; `make setup` flips these to cpu/int8 when
+    # the NVIDIA Docker runtime isn't available.
+    device: cuda
+    compute_type: float16
+    beam_size: 1
+    cpu_threads: 0
+    # Optional decoder bias — short list of canonical phrases improves
+    # recall on rare names. Keep under ~200 chars to avoid prompt bleed.
+    initial_prompt: null
+  SenseVoiceOnnx:
+    # int8 sherpa-onnx SenseVoiceSmall — no PyTorch, lighter for Pi-class hosts
+    # (#135). Opt-in: set selected_module.ASR: SenseVoiceOnnx to use it.
+    # Requires `make fetch-models` (models/SenseVoiceSmall-onnx/) + the
+    # sensevoice_onnx.py mount in docker-compose.
+    type: sensevoice_onnx
+    model_dir: models/SenseVoiceSmall-onnx
+    output_dir: tmp/
+    language: en          # auto, zh, en, ja, ko, yue
+    num_threads: 2
+    use_itn: true
+
+TTS:
+  EdgeTTS:
+    type: edge
+    voice: en-AU-WilliamNeural
+    output_dir: tmp/
+  StreamingEdgeTTS:
+    type: edge_stream
+    voice: en-AU-WilliamNeural
+    output_dir: tmp/
+  LocalPiper:
+    type: piper_local
+    voice: en_GB-cori-medium
+    model_path: /opt/xiaozhi-esp32-server/models/piper/en_GB-cori-medium.onnx
+    config_path: /opt/xiaozhi-esp32-server/models/piper/en_GB-cori-medium.onnx.json
+    output_dir: tmp/
+
+LLM:
+  # PiVoiceLLM — routes voice turns to the `dotty-pi` container via
+  # `docker exec -i dotty-pi pi --mode rpc ...`. Pi owns the agent loop and
+  # invokes tools (memory_lookup, think_hard, play_song, remember, ...) inside
+  # the dotty-pi-ext extension; only TTS-bound text reaches xiaozhi. See
+  # custom-providers/pi_voice/README.md for the architecture + the host-docker-
+  # socket requirement (the xiaozhi container must have /var/run/docker.sock
+  # and /usr/bin/docker bind-mounted — see docker-compose.yml).
+  PiVoiceLLM:
+    type: pi_voice
+    container_name: dotty-pi
+
+  # Generic OpenAI-compatible provider — works with OpenAI, OpenRouter,
+  # Ollama (http://host:11434/v1), LM Studio, vLLM, etc.
+  OpenAICompat:
+    type: openai_compat
+    # Base URL for the API (must end at /v1 — the provider appends /chat/completions).
+    # Examples:
+    #   OpenAI:      https://api.openai.com/v1
+    #   OpenRouter:  https://openrouter.ai/api/v1
+    #   Ollama:      http://localhost:11434/v1
+    #   LM Studio:   http://localhost:1234/v1
+    #   vLLM:        http://localhost:8000/v1
+    url: <OPENAI_COMPAT_URL>
+    api_key: <OPENAI_COMPAT_API_KEY>
+    model: <OPENAI_COMPAT_MODEL>
+    # Path to a persona markdown file loaded as the system prompt.
+    # Relative paths resolve from the xiaozhi-server working directory
+    # inside the container (/opt/xiaozhi-esp32-server).
+    persona_file: personas/default.md
+    max_tokens: 256
+    temperature: 0.7
+    timeout: 60

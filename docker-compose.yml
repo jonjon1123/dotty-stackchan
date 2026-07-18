@@ -1,0 +1,184 @@
+# Dotty — unified stack compose
+#
+# Replaces the five separate compose files (docker-compose.yml,
+# dotty-pi/docker-compose.yml, bridge/docker-compose.yml,
+# dotty-behaviour/docker-compose.yml, docker-compose.llama-swap.yml).
+#
+# All containers live on the `dotty-net` bridge network. Inter-service
+# traffic uses container names; only the ports below are published to
+# the host:
+#   8000 — xiaozhi WebSocket
+#   8003 — xiaozhi OTA / HTTP admin
+#   8080 — llama-swap LLM API + dashboard (/ui)
+#   8081 — bridge dashboard (/ui)
+#
+# Shared state lives under ./state/ (gitignored). The bridge owns writes
+# to kid-mode / smart-mode toggles; xiaozhi-server and dotty-behaviour
+# mount them read-only.
+
+networks:
+  dotty-net:
+    driver: bridge
+
+services:
+  # ── xiaozhi-esp32-server — voice pipeline (ASR/LLM/TTS) ───────────
+  xiaozhi-esp32-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xiaozhi-esp32-server-piper:local
+    container_name: dotty-xiaozhi-esp32-server
+    restart: unless-stopped
+    networks: [dotty-net]
+    # --- BEGIN CUDA BLOCK (comment out if no NVIDIA runtime) ---
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # --- END CUDA BLOCK ---
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TZ=${TZ}
+      - VISION_BRIDGE_URL=http://dotty-behaviour:${DOTTY_BEHAVIOUR_PORT}
+      - PERSONA=${PERSONA:-default}
+      - DOTTY_KID_MODE_STATE=/var/lib/dotty/shared/kid-mode
+      - DOTTY_SMART_MODE_STATE=/var/lib/dotty/shared/smart-mode
+      - DOTTY_ADMIN_TOKEN=${DOTTY_ADMIN_TOKEN:-}
+    ports:
+      - "8000:8000"
+      - "8003:8003"
+    volumes:
+      - ./data/.config.yaml:/opt/xiaozhi-esp32-server/data/.config.yaml:ro
+      - ./models/SenseVoiceSmall:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall
+      - ./tmp:/opt/xiaozhi-esp32-server/tmp
+      - ./custom-providers/openai_compat:/opt/xiaozhi-esp32-server/core/providers/llm/openai_compat
+      - ./custom-providers/pi_voice:/opt/xiaozhi-esp32-server/core/providers/llm/pi_voice
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./personas:/opt/xiaozhi-esp32-server/personas:ro
+      - ./custom-providers/edge_stream/edge_stream.py:/opt/xiaozhi-esp32-server/core/providers/tts/edge_stream.py:ro
+      - ./custom-providers/piper_local/piper_local.py:/opt/xiaozhi-esp32-server/core/providers/tts/piper_local.py:ro
+      - ./models/piper:/opt/xiaozhi-esp32-server/models/piper:ro
+      - ./custom-providers/asr/fun_local.py:/opt/xiaozhi-esp32-server/core/providers/asr/fun_local.py:ro
+      - ./custom-providers/asr/whisper_local.py:/opt/xiaozhi-esp32-server/core/providers/asr/whisper_local.py:ro
+      - ./models/whisper-small.en-ct2:/opt/xiaozhi-esp32-server/models/whisper-small.en-ct2:ro
+      - ./custom-providers/asr/sensevoice_onnx.py:/opt/xiaozhi-esp32-server/core/providers/asr/sensevoice_onnx.py:ro
+      - ./models/SenseVoiceSmall-onnx:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall-onnx:ro
+      - ./receiveAudioHandle.py:/opt/xiaozhi-esp32-server/core/handle/receiveAudioHandle.py:ro
+      - ./dances.py:/opt/xiaozhi-esp32-server/core/handle/dances.py:ro
+      - ./custom-providers/textUtils.py:/opt/xiaozhi-esp32-server/core/utils/textUtils.py:ro
+      - ./custom-providers/xiaozhi-patches/device_command.py:/opt/xiaozhi-esp32-server/core/utils/device_command.py:ro
+      - ./songs:/opt/xiaozhi-esp32-server/config/assets/songs:ro
+      - ./custom-providers/xiaozhi-patches/portal_bridge.py:/opt/xiaozhi-esp32-server/core/portal_bridge.py:ro
+      - ./custom-providers/xiaozhi-patches/websocket_server.py:/opt/xiaozhi-esp32-server/core/websocket_server.py:ro
+      - ./custom-providers/xiaozhi-patches/http_server.py:/opt/xiaozhi-esp32-server/core/http_server.py:ro
+      - ./custom-providers/xiaozhi-patches/textMessageHandlerRegistry.py:/opt/xiaozhi-esp32-server/core/handle/textMessageHandlerRegistry.py:ro
+      - ./custom-providers/xiaozhi-patches/ota_handler.py:/opt/xiaozhi-esp32-server/core/api/ota_handler.py:ro
+      - ./data/bin:/opt/xiaozhi-esp32-server/data/bin
+      # Shared kid/smart-mode toggle state (read-only — bridge owns writes)
+      - ./state/shared:/var/lib/dotty/shared:ro
+
+  # ── llama-swap — local LLM inference ──────────────────────────────
+  llama-swap:
+    image: ghcr.io/mostlygeek/llama-swap:unified-cuda
+    container_name: llama-swap
+    restart: unless-stopped
+    networks: [dotty-net]
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./data/llama-swap.config.yaml:/etc/llama-swap/config/config.yaml
+      - ./models:/models
+
+  # ── dotty-bridge — admin dashboard (FastAPI /ui) ──────────────────
+  dotty-bridge:
+    build:
+      context: .
+      dockerfile: bridge/Dockerfile
+    image: dotty-bridge:0.1.0
+    container_name: dotty-bridge
+    restart: unless-stopped
+    networks: [dotty-net]
+    ports:
+      - "8081:8081"
+    environment:
+      - TZ=${TZ}
+      - PORT=${PORT:-8081}
+      - PYTHONUNBUFFERED=1
+      - XIAOZHI_HOST=dotty-xiaozhi-esp32-server
+      - XIAOZHI_OTA_PORT=8003
+      - DOTTY_KID_MODE_STATE=/var/lib/dotty/shared/kid-mode
+      - DOTTY_SMART_MODE_STATE=/var/lib/dotty/shared/smart-mode
+      - CONVO_LOG_DIR=/var/lib/dotty/logs
+      - HOUSEHOLD_YAML_PATH=/var/lib/dotty/shared/household.yaml
+      - CALENDAR_SA_PATH=/var/lib/dotty/secrets/google-calendar-sa.json
+      - DOTTY_ADMIN_TOKEN=${DOTTY_ADMIN_TOKEN:-}
+      - DOTTY_BEHAVIOUR_URL=http://dotty-behaviour:${DOTTY_BEHAVIOUR_PORT}
+    volumes:
+      # Shared toggle state (bridge writes; xiaozhi + behaviour read)
+      - ./state/shared:/var/lib/dotty/shared
+      # Bridge-specific logs and secrets
+      - ./state/logs:/var/lib/dotty/logs
+      - ./state/secrets:/var/lib/dotty/secrets:ro
+
+  # ── dotty-pi — the brain (pi coding agent, invoked via docker exec) ──
+  dotty-pi:
+    build:
+      context: .
+      dockerfile: dotty-pi/Dockerfile
+    image: dotty-pi:0.1.0
+    container_name: dotty-pi
+    restart: unless-stopped
+    networks: [dotty-net]
+    environment:
+      - DOTTY_ADMIN_TOKEN=${DOTTY_ADMIN_TOKEN:-}
+    volumes:
+      # Runtime state — extension source is baked in; models.json is mounted
+      # from the repo to stay in sync with data/llama-swap.config.yaml.
+      - ./dotty-pi/models.json:/root/.pi/agent/models.json:ro
+      - ./state/pi/memory:/root/.pi/memory
+      - ./state/pi/persona:/root/.pi/persona
+      - ./state/pi/agent/auth.json:/root/.pi/agent/auth.json
+      - ./state/pi/sessions:/root/.pi/sessions
+    command: ["sleep", "infinity"]
+
+  # ── dotty-behaviour — perception bus, greeter, vision/audio explain ──
+  dotty-behaviour:
+    build:
+      context: ./dotty-behaviour
+      dockerfile: Dockerfile
+    image: dotty-behaviour:0.1.0
+    container_name: dotty-behaviour
+    restart: unless-stopped
+    networks: [dotty-net]
+    environment:
+      - TZ=${TZ}
+      - DOTTY_BEHAVIOUR_PORT=8090
+      - XIAOZHI_HOST=dotty-xiaozhi-esp32-server
+      - XIAOZHI_OTA_PORT=8003
+      - NARRATIVE_LLM_URL=http://llama-swap:8080/v1
+      - NARRATIVE_MODEL=${NARRATIVE_MODEL:-think-big}
+      - NARRATIVE_TIMEOUT_SEC=${NARRATIVE_TIMEOUT_SEC:-90}
+      - CONVO_LOG_DIR=/var/lib/dotty/logs
+      - DOTTY_STATE_DIR=/var/lib/dotty/behaviour
+      - HOUSEHOLD_YAML_PATH=/var/lib/dotty/shared/household.yaml
+      - GREETER_STATE_PATH=/var/lib/dotty/behaviour/greeter_state.json
+      - DOTTY_ADMIN_TOKEN=${DOTTY_ADMIN_TOKEN:-}
+    volumes:
+      # Shared state (household.yaml — bridge writes, behaviour reads)
+      - ./state/shared:/var/lib/dotty/shared
+      # Behaviour-specific state and logs
+      - ./state/behaviour:/var/lib/dotty/behaviour
+      - ./state/logs:/var/lib/dotty/logs
+      - ./state/secrets:/var/lib/dotty/secrets:ro

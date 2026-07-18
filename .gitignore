@@ -49,8 +49,8 @@ package-lock.json
 # git (.config.yaml.template, docker-compose.yml.template,
 # zeroclaw-bridge.service.template); rendered copies are per-deployment.
 /.config.yaml
-/data/.config.yaml
-/docker-compose.yml
+#/data/.config.yaml
+#/docker-compose.yml
 /zeroclaw-bridge.service
 /.wizard.env
 
