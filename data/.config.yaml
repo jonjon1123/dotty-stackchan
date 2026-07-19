@@ -11,6 +11,8 @@ log:
 
 delete_audio: true
 
+close_connection_no_voice_time: 120
+
 selected_module:
   VAD: SileroVAD
   ASR: WhisperLocal       # WhisperLocal (CUDA) / FunASR (CPU fallback) / SenseVoiceOnnx (int8, no-torch)
@@ -38,6 +40,11 @@ prompt: |
   Voice and persona:
   - Warm, competent, a little bit playful.
   - Your brain runs as a pi agent in the dotty-pi container; voice I/O runs on xiaozhi-server. Both live on the same Docker host.
+
+end_prompt:
+  enable: false
+  prompt: |
+    "Just say the work 'goodbye' to end the conversation."
 
 VAD:
   SileroVAD:
